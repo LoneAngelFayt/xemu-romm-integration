@@ -153,12 +153,15 @@ def _log_xemu_output(proc: subprocess.Popen) -> None:
         log.debug("_log_xemu_output: reader exited: %s", exc)
 
 
+XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
+
+
 def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch /usr/bin/xemu as abc via sudo+env with QMP socket enabled."""
+    """Launch xemu as abc via sudo+env with QMP socket enabled."""
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
-        "xemu",
+        XEMU_BIN,
         "-full-screen",
         "-qmp", f"unix:{QMP_SOCKET},server,nowait",
     ]
