@@ -478,6 +478,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
+                if _session["save_in_progress"]:
+                    self._send_json(409, {"error": "save in progress"})
+                    return
             body = self._read_body()
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 9):
