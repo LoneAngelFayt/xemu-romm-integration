@@ -12,7 +12,7 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[xemu-broker-mod] Cleaned up stale display sockets."
 
-# ── python3 + wmctrl availability ────────────────────────────────────────────
+# ── python3 availability ─────────────────────────────────────────────────────
 _need_apt=0
 command -v python3 &>/dev/null || _need_apt=1
 if [ "$_need_apt" = "1" ]; then
