@@ -15,10 +15,9 @@ echo "[xemu-broker-mod] Cleaned up stale display sockets."
 # ── python3 + wmctrl availability ────────────────────────────────────────────
 _need_apt=0
 command -v python3 &>/dev/null || _need_apt=1
-command -v wmctrl  &>/dev/null || _need_apt=1
 if [ "$_need_apt" = "1" ]; then
-    echo "[xemu-broker-mod] Installing missing packages (python3, wmctrl)..."
-    apt-get update -qq && apt-get install -y -qq python3 wmctrl \
+    echo "[xemu-broker-mod] Installing missing packages (python3)..."
+    apt-get update -qq && apt-get install -y -qq python3 \
         || echo "[xemu-broker-mod] ERROR: apt-get install failed"
 fi
 

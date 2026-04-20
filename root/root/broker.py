@@ -237,19 +237,6 @@ def _launch_xemu(rom_path: str | None) -> None:
 
 # ── QMP helpers ───────────────────────────────────────────────────────────────
 
-def _qmp_recv_line(sock: _socket.socket) -> dict:
-    """Receive one newline-terminated JSON object from a QMP socket."""
-    buf = b""
-    while True:
-        if b"\n" in buf:
-            line, _, _ = buf.partition(b"\n")
-            return json.loads(line)
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise OSError("QMP socket closed unexpectedly")
-        buf += chunk
-
-
 def _qmp_command(cmd: str, args: dict | None = None) -> dict:
     """Open a fresh QMP connection, negotiate capabilities, send one command.
 
@@ -265,21 +252,33 @@ def _qmp_command(cmd: str, args: dict | None = None) -> dict:
         payload["arguments"] = args
 
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    buf = b""
+
+    def recv_line() -> dict:
+        nonlocal buf
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("QMP socket closed unexpectedly")
+            buf += chunk
+        line, _, buf = buf.partition(b"\n")
+        return json.loads(line)
+
     try:
         sock.settimeout(QMP_TIMEOUT)
         sock.connect(str(QMP_SOCKET))
 
         # 1. Read QMP greeting: {"QMP": {"version": {...}, "capabilities": [...]}}
-        _qmp_recv_line(sock)
+        recv_line()
 
         # 2. Negotiate capabilities
         sock.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
-        _qmp_recv_line(sock)  # {"return": {}}
+        recv_line()  # {"return": {}}
 
         # 3. Send command. savevm/loadvm may block for several seconds.
         sock.settimeout(QMP_WAIT)
         sock.sendall(json.dumps(payload).encode() + b"\n")
-        response = _qmp_recv_line(sock)
+        response = recv_line()
     except (OSError, json.JSONDecodeError) as exc:
         sock.close()
         raise OSError(f"QMP {cmd} failed: {exc}") from exc
@@ -586,6 +585,7 @@ def main():
         time.sleep(3)
         subprocess.run(["pkill", "-9", "-x", "xemu"], capture_output=True)
         time.sleep(1)
+    QMP_SOCKET.unlink(missing_ok=True)
 
     # Auto-launch xemu so the stream shows something while no game is running.
     Thread(target=_launch_xemu, args=(None,), daemon=True).start()
