@@ -25,21 +25,27 @@ QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT    = float(os.environ.get("QMP_WAIT", "10.0"))
 
 # ENV passed to xemu via sudo -u abc env.
-# DISPLAY=:0       — Xwayland under labwc (pixelflux compositor chain)
-# WAYLAND_DISPLAY  — inherited from the session (labwc compositor, typically wayland-0)
-# LD_PRELOAD       — interposer redirects /dev/input/* opens to selkies sockets.
-#                    libudev.so.1.0.0-fake intentionally excluded — it intercepts
-#                    Mesa/DRI udev calls and causes a black screen (same as Eden).
+# DISPLAY=:0            — Xwayland under labwc (pixelflux compositor chain)
+# WAYLAND_DISPLAY       — inherited from the session (labwc compositor, typically wayland-0)
+# SDL_VIDEODRIVER=wayland — forces SDL2 to use the Wayland backend so GPU
+#                           initialisation uses the DRM fd from the compositor
+#                           rather than udev/DRI3.  This makes it safe to load
+#                           libudev.so.1.0.0-fake (which intercepts udev calls)
+#                           without breaking Mesa/DRI GPU discovery.
+# LD_PRELOAD            — joystick interposer redirects /dev/input/* opens to
+#                          selkies sockets; fake libudev makes SDL2's udev-based
+#                          joystick enumeration see the virtual devices.
 ENV = {
     "DISPLAY":            ":0",
     "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    "SDL_VIDEODRIVER":    "wayland",
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     "DRI_NODE":           os.environ.get("DRI_NODE", ""),
     "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
+    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
 }
 
 logging.basicConfig(
