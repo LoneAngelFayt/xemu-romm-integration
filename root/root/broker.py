@@ -588,6 +588,24 @@ def main():
         time.sleep(1)
     QMP_SOCKET.unlink(missing_ok=True)
 
+    # Wait for selkies gamepad sockets before auto-launching xemu so that SDL
+    # detects controllers on startup.  SDL scans /dev/input/ once at init and
+    # only picks up hot-plugged devices when new device *files* appear — the
+    # pre-created js0-js3 device nodes are always present, so SDL gets no
+    # inotify event when the sockets arrive later.  If the browser connects
+    # with a gamepad before this deadline, xemu starts with sockets ready and
+    # SDL detects the controller immediately.  After the deadline xemu launches
+    # anyway so the stream is never blank indefinitely.
+    _SOCKET_WAIT = float(os.environ.get("SOCKET_WAIT", "30"))
+    _deadline = time.monotonic() + _SOCKET_WAIT
+    while time.monotonic() < _deadline:
+        if glob.glob("/tmp/selkies_js*.sock"):
+            log.info("Selkies gamepad sockets detected — launching xemu with controller support.")
+            break
+        time.sleep(1)
+    else:
+        log.info("No selkies gamepad sockets after %.0fs — launching xemu without controller.", _SOCKET_WAIT)
+
     # Auto-launch xemu so the stream shows something while no game is running.
     Thread(target=_launch_xemu, args=(None,), daemon=True).start()
 
