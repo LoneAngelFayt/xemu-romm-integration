@@ -17,16 +17,15 @@ from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PORT        = int(os.environ.get("BROKER_PORT", "8000"))
-SECRET      = os.environ.get("BROKER_SECRET", "")
-ROM_ROOT    = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-QMP_SOCKET  = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
+PORT = int(os.environ.get("BROKER_PORT", "8000"))
+SECRET = os.environ.get("BROKER_SECRET", "")
+ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
+QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
-QMP_WAIT    = float(os.environ.get("QMP_WAIT", "10.0"))
+QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 
-# ENV passed to xemu via sudo -u abc env.
-# DISPLAY=:0       — Xwayland under labwc (pixelflux compositor chain)
-# WAYLAND_DISPLAY  — inherited from the session (labwc compositor, typically wayland-0)
+# ENV vars set in the broker's own environment before xemu launch.
+# Passed through to xemu via sudo -E (preserve-env).
 # SDL_JOYSTICK_LINUX_DISABLE_UDEV — tells SDL2 to use inotify/direct-scan for
 #                    joystick enumeration instead of udev.  xemu ships a bundled
 #                    SDL2 that requires udev for enumeration (no inotify fallback
@@ -39,20 +38,22 @@ QMP_WAIT    = float(os.environ.get("QMP_WAIT", "10.0"))
 #                    sockets.  Fake libudev intentionally excluded — it intercepts
 #                    Mesa/Vulkan GPU discovery calls and causes a black screen.
 ENV = {
-    "DISPLAY":                         ":0",
-    "WAYLAND_DISPLAY":                 os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    "DISPLAY": ":0",
+    "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
     "SDL_JOYSTICK_LINUX_DISABLE_UDEV": "1",
-    "XDG_RUNTIME_DIR":                 "/config/.XDG",
-    "PULSE_RUNTIME_PATH":              "/defaults",
-    "DRI_NODE":                        os.environ.get("DRI_NODE", ""),
-    "DRINODE":                         os.environ.get("DRINODE", ""),
-    "HOME":                            "/config",
-    "USER":                            "abc",
-    "LD_PRELOAD":                      "/usr/lib/selkies_joystick_interposer.so",
+    "XDG_RUNTIME_DIR": "/config/.XDG",
+    "PULSE_RUNTIME_PATH": "/defaults",
+    "DRI_NODE": os.environ.get("DRI_NODE", ""),
+    "DRINODE": os.environ.get("DRINODE", ""),
+    "HOME": "/config",
+    "USER": "abc",
+    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
 }
 
 logging.basicConfig(
-    level=getattr(logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=getattr(
+        logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO
+    ),
     format="%(asctime)s [broker] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
@@ -63,15 +64,16 @@ log = logging.getLogger("broker")
 
 _session_lock = Lock()
 _session: dict = {
-    "process":          None,
-    "rom_path":         None,
-    "rom_name":         None,
-    "started_at":       None,
-    "is_managed":       False,
+    "process": None,
+    "rom_path": None,
+    "rom_name": None,
+    "started_at": None,
+    "is_managed": False,
     "save_in_progress": False,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _validate_rom_path(raw: str) -> Path | None:
     """Resolve raw to an absolute path and confirm it lives under ROM_ROOT."""
@@ -147,7 +149,11 @@ def _cleanup_stale_sockets() -> None:
                 pass
 
     if removed:
-        log.debug("Socket cleanup: removed %d stale socket(s) (of %d total).", removed, len(paths))
+        log.debug(
+            "Socket cleanup: removed %d stale socket(s) (of %d total).",
+            removed,
+            len(paths),
+        )
 
 
 def _log_xemu_output(proc: subprocess.Popen) -> None:
@@ -165,19 +171,32 @@ XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
 
 
 def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch xemu as abc via sudo+env with QMP socket enabled."""
+    """Launch xemu as abc via sudo -E (preserve-env) with QMP socket enabled."""
+    # Set env vars in broker's own environment so sudo -E passes them through.
+    for k, v in ENV.items():
+        os.environ[k] = v
+
     cmd = [
-        "sudo", "-u", "abc", "env",
-        *[f"{k}={v}" for k, v in ENV.items()],
+        "sudo",
+        "-E",
+        "-u",
+        "abc",
+        "--",
         XEMU_BIN,
         "-full-screen",
-        "-qmp", f"unix:{QMP_SOCKET},server,nowait",
+        "-qmp",
+        f"unix:{QMP_SOCKET},server,nowait",
     ]
     if rom_path:
         cmd.extend(["-dvd_path", rom_path])
 
     log.info("Launching xemu (rom=%s)", rom_path or "dashboard")
     log.debug("_launch_xemu_internal: cmd=%s", " ".join(cmd))
+    log.debug(
+        "_launch_xemu_internal: SDL_JOYSTICK_LINUX_DISABLE_UDEV=%s, LD_PRELOAD=%s",
+        os.environ.get("SDL_JOYSTICK_LINUX_DISABLE_UDEV"),
+        os.environ.get("LD_PRELOAD"),
+    )
 
     try:
         proc = subprocess.Popen(
@@ -208,7 +227,8 @@ def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
     duration = time.monotonic() - start_time
     log.debug(
         "_monitor_process: xemu exited (code=%s, duration=%.1fs)",
-        exit_code, duration,
+        exit_code,
+        duration,
     )
 
     with _session_lock:
@@ -221,13 +241,17 @@ def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
     wait_time = 5 if duration < 5 else 1  # longer delay for quick crashes
     log.info(
         "xemu exited after %.1fs (code=%s) — relaunching dashboard in %ds",
-        duration, exit_code, wait_time,
+        duration,
+        exit_code,
+        wait_time,
     )
     time.sleep(wait_time)
 
     with _session_lock:
         if not _session["is_managed"]:
-            log.debug("_monitor_process: managed cleared during sleep — aborting relaunch")
+            log.debug(
+                "_monitor_process: managed cleared during sleep — aborting relaunch"
+            )
             return
 
     _launch_xemu(None)
@@ -247,6 +271,7 @@ def _launch_xemu(rom_path: str | None) -> None:
 
 
 # ── QMP helpers ───────────────────────────────────────────────────────────────
+
 
 def _qmp_command(cmd: str, args: dict | None = None) -> dict:
     """Open a fresh QMP connection, negotiate capabilities, send one command.
@@ -329,7 +354,10 @@ def _qmp_load_state(slot: int) -> bool:
 # ── PulseAudio helpers ────────────────────────────────────────────────────────
 
 _PACTL_CMD = [
-    "sudo", "-u", "abc", "env",
+    "sudo",
+    "-u",
+    "abc",
+    "env",
     "PULSE_RUNTIME_PATH=/defaults",
     "HOME=/config",
     "USER=abc",
@@ -354,8 +382,8 @@ def _pactl_get_mute() -> bool | None:
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
-class BrokerHandler(BaseHTTPRequestHandler):
 
+class BrokerHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.debug("HTTP %s", fmt % args)
 
@@ -400,15 +428,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     and _session["process"].poll() is None
                     and _session["rom_path"] is not None
                 )
-                rom_path   = _session["rom_path"]   if active else None
-                rom_name   = _session["rom_name"]   if active else None
+                rom_path = _session["rom_path"] if active else None
+                rom_name = _session["rom_name"] if active else None
                 started_at = _session["started_at"] if active else None
-            self._send_json(200, {
-                "active":     active,
-                "rom_path":   rom_path,
-                "rom_name":   rom_name,
-                "started_at": started_at,
-            })
+            self._send_json(
+                200,
+                {
+                    "active": active,
+                    "rom_path": rom_path,
+                    "rom_name": rom_name,
+                    "started_at": started_at,
+                },
+            )
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -441,6 +472,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok", "saved": ok})
                 Thread(target=_launch_xemu, args=(None,), daemon=True).start()
             else:
+
                 def _bg():
                     try:
                         ok = _qmp_save_state(10)
@@ -451,6 +483,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         log.warning("save-and-exit: QMP save failed — exiting anyway")
                     _kill_xemu()
                     _launch_xemu(None)
+
                 Thread(target=_bg, daemon=True).start()
                 self._send_json(200, {"status": "queued", "saved": False})
             return
@@ -471,6 +504,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _session["save_in_progress"] = False
                 self._send_json(400, {"error": "slot must be 1–9"})
                 return
+
             def _bg_save(s):
                 try:
                     ok = _qmp_save_state(s)
@@ -479,6 +513,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         _session["save_in_progress"] = False
                 if not ok:
                     log.warning("save-state: QMP save failed for slot %d", s)
+
             Thread(target=_bg_save, args=(slot,), daemon=True).start()
             self._send_json(200, {"status": "saving", "slot": slot})
             return
@@ -511,7 +546,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
-                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
+                self._send_json(
+                    500, {"error": "pactl failed", "detail": result.stderr.strip()}
+                )
                 return
             log.info("Volume set to %d%%", level)
             self._send_json(200, {"status": "ok", "level": level})
@@ -525,7 +562,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 mute_arg = "toggle"
             result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
             if result.returncode != 0:
-                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
+                self._send_json(
+                    500, {"error": "pactl failed", "detail": result.stderr.strip()}
+                )
                 return
             mute_state = _pactl_get_mute()
             log.info("Mute %s", "on" if mute_state else "off")
@@ -545,13 +584,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         rom_path = _validate_rom_path(raw_path)
         if rom_path is None:
-            self._send_json(400, {
-                "error": "rom_path must be within ROM_ROOT",
-                "rom_root": str(ROM_ROOT),
-            })
+            self._send_json(
+                400,
+                {
+                    "error": "rom_path must be within ROM_ROOT",
+                    "rom_root": str(ROM_ROOT),
+                },
+            )
             return
         if not rom_path.exists():
-            self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
+            self._send_json(
+                422, {"error": "rom_path does not exist", "path": str(rom_path)}
+            )
             return
 
         Thread(target=_launch_xemu, args=(str(rom_path),), daemon=True).start()
@@ -574,18 +618,26 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
+        self.send_header(
+            "Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret"
+        )
         self.end_headers()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main():
     log.info("Broker starting — waiting 5s for desktop to initialise...")
     if not SECRET:
-        log.warning("BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated")
+        log.warning(
+            "BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated"
+        )
 
-    log.debug("Startup ENV: %s", {k: ("***" if k == "BROKER_SECRET" else v) for k, v in ENV.items()})
+    log.debug(
+        "Startup ENV: %s",
+        {k: ("***" if k == "BROKER_SECRET" else v) for k, v in ENV.items()},
+    )
 
     time.sleep(5)
 
@@ -610,11 +662,16 @@ def main():
     _deadline = time.monotonic() + _SOCKET_WAIT
     while time.monotonic() < _deadline:
         if glob.glob("/tmp/selkies_js*.sock"):
-            log.info("Selkies gamepad sockets detected — launching xemu with controller support.")
+            log.info(
+                "Selkies gamepad sockets detected — launching xemu with controller support."
+            )
             break
         time.sleep(1)
     else:
-        log.info("No selkies gamepad sockets after %.0fs — launching xemu without controller.", _SOCKET_WAIT)
+        log.info(
+            "No selkies gamepad sockets after %.0fs — launching xemu without controller.",
+            _SOCKET_WAIT,
+        )
 
     # Auto-launch xemu so the stream shows something while no game is running.
     Thread(target=_launch_xemu, args=(None,), daemon=True).start()
