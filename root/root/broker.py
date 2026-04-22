@@ -25,28 +25,30 @@ QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT    = float(os.environ.get("QMP_WAIT", "10.0"))
 
 # ENV passed to xemu via sudo -u abc env.
-# DISPLAY=:0       — Xwayland under labwc (pixelflux compositor chain).
-#                    SDL2 picks the X11 backend (DRI3 path) when DISPLAY is set,
-#                    which is intentional: DRI3 gets its DRM fd from Xwayland
-#                    without calling udev, so libudev.so.1.0.0-fake does not
-#                    interfere with Mesa/GPU initialisation.
-# WAYLAND_DISPLAY  — inherited from the session (labwc compositor, typically wayland-0).
+# DISPLAY=:0       — Xwayland under labwc (pixelflux compositor chain)
+# WAYLAND_DISPLAY  — inherited from the session (labwc compositor, typically wayland-0)
+# SDL_JOYSTICK_LINUX_DISABLE_UDEV — tells SDL2 to use inotify/direct-scan for
+#                    joystick enumeration instead of udev.  xemu ships a bundled
+#                    SDL2 that requires udev for enumeration (no inotify fallback
+#                    when udev is present), while /opt/lib/libudev.so.1.0.0-fake
+#                    (the selkies fake udev) breaks Mesa/Vulkan GPU discovery.
+#                    This hint bypasses udev entirely so the pre-created
+#                    /dev/input/js0-js3 nodes are found via direct scan and the
+#                    joystick interposer can redirect I/O to the selkies sockets.
 # LD_PRELOAD       — joystick interposer redirects /dev/input/* opens to selkies
-#                    sockets; fake libudev makes SDL2's udev-based joystick
-#                    enumeration see the virtual devices.  Safe here because
-#                    SDL's DRI3/X11 path obtains the GPU fd from Xwayland, not
-#                    via udev (unlike the Wayland SDL backend which does use udev
-#                    for GPU discovery and breaks with the fake library).
+#                    sockets.  Fake libudev intentionally excluded — it intercepts
+#                    Mesa/Vulkan GPU discovery calls and causes a black screen.
 ENV = {
-    "DISPLAY":            ":0",
-    "WAYLAND_DISPLAY":    os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
-    "XDG_RUNTIME_DIR":    "/config/.XDG",
-    "PULSE_RUNTIME_PATH": "/defaults",
-    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-    "DRINODE":            os.environ.get("DRINODE", ""),
-    "HOME":               "/config",
-    "USER":               "abc",
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+    "DISPLAY":                         ":0",
+    "WAYLAND_DISPLAY":                 os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
+    "SDL_JOYSTICK_LINUX_DISABLE_UDEV": "1",
+    "XDG_RUNTIME_DIR":                 "/config/.XDG",
+    "PULSE_RUNTIME_PATH":              "/defaults",
+    "DRI_NODE":                        os.environ.get("DRI_NODE", ""),
+    "DRINODE":                         os.environ.get("DRINODE", ""),
+    "HOME":                            "/config",
+    "USER":                            "abc",
+    "LD_PRELOAD":                      "/usr/lib/selkies_joystick_interposer.so",
 }
 
 logging.basicConfig(
