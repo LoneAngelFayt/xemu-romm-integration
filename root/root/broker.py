@@ -45,7 +45,7 @@ ENV = {
     "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
-    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake",
+    "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
 }
 
 logging.basicConfig(
