@@ -29,6 +29,63 @@ mkdir -p "$(dirname "$AUTOSTART")"
 printf '# Disabled by xemu-broker-mod\n' > "$AUTOSTART"
 echo "[xemu-broker-mod] Disabled labwc autostart."
 
+# ── Seed xemu.toml defaults ──────────────────────────────────────────────────
+# xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.
+# We seed two things:
+#   [input.bindings]   port1_driver = 'usb-xbox-gamepad'  — always, so a
+#                      fresh container presents port 1 as an SDL gamepad
+#                      without requiring manual UI setup.
+#   [display]          renderer = 'Vulkan'                 — only on AMD GPUs,
+#                      where Vulkan outperforms OpenGL.
+# Keys are only written if not already present so user edits are preserved.
+XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
+
+_amd_gpu=0
+grep -q '^amdgpu ' /proc/modules 2>/dev/null && _amd_gpu=1
+
+if [ "$_amd_gpu" = "1" ]; then
+    echo "[xemu-broker-mod] AMD GPU detected — will seed Vulkan renderer."
+else
+    echo "[xemu-broker-mod] No AMD GPU detected — skipping Vulkan renderer seed."
+fi
+
+python3 - "$XEMU_CONFIG" "$_amd_gpu" <<'PYEOF'
+import sys, re
+from pathlib import Path
+
+p = Path(sys.argv[1])
+amd_gpu = sys.argv[2] == '1'
+
+p.parent.mkdir(parents=True, exist_ok=True)
+text = p.read_text() if p.exists() else ''
+
+def _seed(txt, section, key, value):
+    """Add key=value under section if key is not already present anywhere."""
+    if re.search(rf'^\s*{re.escape(key)}\s*=', txt, re.MULTILINE):
+        return txt, False  # already set, preserve user value
+    section_pat = rf'(^{re.escape(section)}[^\n]*\n)'
+    if re.search(section_pat, txt, re.MULTILINE):
+        txt = re.sub(section_pat, rf'\g<1>{key} = {value}\n', txt, count=1, flags=re.MULTILINE)
+    else:
+        txt += f'\n{section}\n{key} = {value}\n'
+    return txt, True
+
+changed = False
+
+text, did = _seed(text, '[input.bindings]', 'port1_driver', "'usb-xbox-gamepad'")
+if did:
+    print("[xemu-broker-mod] Seeded [input.bindings] port1_driver = 'usb-xbox-gamepad'.")
+
+if amd_gpu:
+    text, did = _seed(text, '[display]', 'renderer', "'Vulkan'")
+    if did:
+        print("[xemu-broker-mod] Seeded [display] renderer = 'Vulkan'.")
+    else:
+        print("[xemu-broker-mod] [display] renderer already set — skipping.")
+
+p.write_text(text)
+PYEOF
+
 # ── Selkies input_handler.py patches ─────────────────────────────────────────
 # Glob over the python version so patches survive base-image upgrades that bump
 # e.g. python3.12 → python3.13.

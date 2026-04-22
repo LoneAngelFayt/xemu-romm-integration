@@ -105,41 +105,39 @@ def _kill_xemu() -> None:
         log.debug("_kill_xemu: process already gone")
 
 
-def _drain_gamepad_sockets() -> None:
-    """Send EOF to each selkies gamepad socket before launching a new session.
+def _cleanup_stale_sockets() -> None:
+    """Remove only dead selkies gamepad socket files before launching a new session.
 
-    Connecting and immediately sending SHUT_WR causes readexactly(1) in phase 1
-    to raise IncompleteReadError — the handler exits cleanly before entering
-    the phase-2 keep-alive loop. Socket files that refuse connection are stale
-    and are unlinked.
+    Sending EOF (SHUT_WR) disconnects the browser's active gamepad client, which
+    causes SDL to see zero devices in the new xemu instance.  We test each socket
+    with a connect-only probe: if the connect succeeds the socket has a live
+    listener (the browser gamepad is still active) and we leave it alone.  If the
+    connect is refused the socket is orphaned and we unlink it.
     """
     paths = sorted(
         glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
     )
     if not paths:
-        log.debug("Socket drain: no gamepad sockets found.")
+        log.debug("Socket cleanup: no gamepad sockets found.")
         return
 
-    drained = 0
     removed = 0
     for path in paths:
         try:
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
                 s.settimeout(0.3)
                 s.connect(path)
-                s.shutdown(_socket.SHUT_WR)
-            drained += 1
+            log.debug("Socket cleanup: %s is alive — leaving it.", path)
         except OSError:
             try:
                 os.unlink(path)
                 removed += 1
+                log.debug("Socket cleanup: removed stale socket %s", path)
             except OSError:
                 pass
 
-    log.debug(
-        "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
-        drained, removed, len(paths),
-    )
+    if removed:
+        log.debug("Socket cleanup: removed %d stale socket(s) (of %d total).", removed, len(paths))
 
 
 def _log_xemu_output(proc: subprocess.Popen) -> None:
@@ -226,9 +224,9 @@ def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
 
 
 def _launch_xemu(rom_path: str | None) -> None:
-    """Top-level launch: kill any running xemu, drain sockets, launch fresh."""
+    """Top-level launch: kill any running xemu, clean up dead sockets, launch fresh."""
     _kill_xemu()
-    _drain_gamepad_sockets()
+    _cleanup_stale_sockets()
     time.sleep(2)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _session_lock:
