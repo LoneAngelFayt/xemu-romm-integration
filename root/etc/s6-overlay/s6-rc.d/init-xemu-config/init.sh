@@ -36,7 +36,7 @@ echo "[xemu-broker-mod] Disabled labwc autostart."
 #                      fresh container presents port 1 as an SDL gamepad
 #                      without requiring manual UI setup.
 #   [display]          renderer = 'Vulkan'                 — only on AMD GPUs,
-#                      where Vulkan outperforms OpenGL.
+#                      to avoid known bug
 # Keys are only written if not already present so user edits are preserved.
 XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
 
