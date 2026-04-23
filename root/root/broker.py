@@ -26,7 +26,6 @@ QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 
 # ENV vars passed to xemu via sudo -u abc env with inline assignments.
 # LD_PRELOAD must be passed inline because sudo -E strips LD_* vars (sudo security filter).
-# Let SDL use udev for hotplug detection so controllers connected after startup are detected.
 # PULSE_RUNTIME_PATH — required to prevent xemu audio assertion failure.
 ENV = {
     "DISPLAY": ":0",
