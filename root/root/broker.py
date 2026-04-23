@@ -107,45 +107,6 @@ def _kill_xemu() -> None:
         log.debug("_kill_xemu: process already gone")
 
 
-def _cleanup_stale_sockets() -> None:
-    """Remove only dead selkies gamepad socket files before launching a new session.
-
-    Sending EOF (SHUT_WR) disconnects the browser's active gamepad client, which
-    causes SDL to see zero devices in the new xemu instance.  We test each socket
-    with a connect-only probe: if the connect succeeds the socket has a live
-    listener (the browser gamepad is still active) and we leave it alone.  If the
-    connect is refused the socket is orphaned and we unlink it.
-    """
-    paths = sorted(
-        glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
-    )
-    if not paths:
-        log.debug("Socket cleanup: no gamepad sockets found.")
-        return
-
-    removed = 0
-    for path in paths:
-        try:
-            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
-                s.settimeout(0.3)
-                s.connect(path)
-            log.debug("Socket cleanup: %s is alive — leaving it.", path)
-        except OSError:
-            try:
-                os.unlink(path)
-                removed += 1
-                log.debug("Socket cleanup: removed stale socket %s", path)
-            except OSError:
-                pass
-
-    if removed:
-        log.debug(
-            "Socket cleanup: removed %d stale socket(s) (of %d total).",
-            removed,
-            len(paths),
-        )
-
-
 def _log_xemu_output(proc: subprocess.Popen) -> None:
     """Read xemu stdout/stderr line-by-line and emit as [xemu] DEBUG log entries."""
     try:
@@ -239,9 +200,8 @@ def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
 
 
 def _launch_xemu(rom_path: str | None) -> None:
-    """Top-level launch: kill any running xemu, clean up dead sockets, launch fresh."""
+    """Top-level launch: kill any running xemu, launch fresh."""
     _kill_xemu()
-    _cleanup_stale_sockets()
     time.sleep(2)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _session_lock:
@@ -630,29 +590,6 @@ def main():
         subprocess.run(["pkill", "-9", "-x", "xemu"], capture_output=True)
         time.sleep(1)
     QMP_SOCKET.unlink(missing_ok=True)
-
-    # Wait for selkies gamepad sockets before auto-launching xemu so that SDL
-    # detects controllers on startup.  SDL scans /dev/input/ once at init and
-    # only picks up hot-plugged devices when new device *files* appear — the
-    # pre-created js0-js3 device nodes are always present, so SDL gets no
-    # inotify event when the sockets arrive later.  If the browser connects
-    # with a gamepad before this deadline, xemu starts with sockets ready and
-    # SDL detects the controller immediately.  After the deadline xemu launches
-    # anyway so the stream is never blank indefinitely.
-    _SOCKET_WAIT = float(os.environ.get("SOCKET_WAIT", "30"))
-    _deadline = time.monotonic() + _SOCKET_WAIT
-    while time.monotonic() < _deadline:
-        if glob.glob("/tmp/selkies_js*.sock"):
-            log.info(
-                "Selkies gamepad sockets detected — launching xemu with controller support."
-            )
-            break
-        time.sleep(1)
-    else:
-        log.info(
-            "No selkies gamepad sockets after %.0fs — launching xemu without controller.",
-            _SOCKET_WAIT,
-        )
 
     # Auto-launch xemu so the stream shows something while no game is running.
     Thread(target=_launch_xemu, args=(None,), daemon=True).start()
