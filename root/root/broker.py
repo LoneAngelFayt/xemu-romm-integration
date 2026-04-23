@@ -26,14 +26,11 @@ QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 
 # ENV vars passed to xemu via sudo -u abc env with inline assignments.
 # LD_PRELOAD must be passed inline because sudo -E strips LD_* vars (sudo security filter).
-# SDL_JOYSTICK_LINUX_DISABLE_UDEV — tells SDL2 to use direct-scan for joystick
-#                    enumeration. This bypasses udev so the pre-created /dev/input/js0-js3
-#                    nodes are found and the interposer can redirect I/O to selkies sockets.
+# Let SDL use udev for hotplug detection so controllers connected after startup are detected.
 # PULSE_RUNTIME_PATH — required to prevent xemu audio assertion failure.
 ENV = {
     "DISPLAY": ":0",
     "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
-    "SDL_JOYSTICK_LINUX_DISABLE_UDEV": "1",
     "XDG_RUNTIME_DIR": "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     "DRI_NODE": os.environ.get("DRI_NODE", ""),
