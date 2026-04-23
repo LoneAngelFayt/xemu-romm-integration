@@ -24,19 +24,12 @@ QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 
-# ENV vars set in the broker's own environment before xemu launch.
-# Passed through to xemu via sudo -E (preserve-env).
-# SDL_JOYSTICK_LINUX_DISABLE_UDEV — tells SDL2 to use inotify/direct-scan for
-#                    joystick enumeration instead of udev.  xemu ships a bundled
-#                    SDL2 that requires udev for enumeration (no inotify fallback
-#                    when udev is present), while /opt/lib/libudev.so.1.0.0-fake
-#                    (the selkies fake udev) breaks Mesa/Vulkan GPU discovery.
-#                    This hint bypasses udev entirely so the pre-created
-#                    /dev/input/js0-js3 nodes are found via direct scan and the
-#                    joystick interposer can redirect I/O to the selkies sockets.
-# LD_PRELOAD       — joystick interposer redirects /dev/input/* opens to selkies
-#                    sockets.  Fake libudev intentionally excluded — it intercepts
-#                    Mesa/Vulkan GPU discovery calls and causes a black screen.
+# ENV vars passed to xemu via sudo -u abc env with inline assignments.
+# LD_PRELOAD must be passed inline because sudo -E strips LD_* vars (sudo security filter).
+# SDL_JOYSTICK_LINUX_DISABLE_UDEV — tells SDL2 to use direct-scan for joystick
+#                    enumeration. This bypasses udev so the pre-created /dev/input/js0-js3
+#                    nodes are found and the interposer can redirect I/O to selkies sockets.
+# PULSE_RUNTIME_PATH — required to prevent xemu audio assertion failure.
 ENV = {
     "DISPLAY": ":0",
     "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
@@ -171,17 +164,13 @@ XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
 
 
 def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch xemu as abc via sudo -E (preserve-env) with QMP socket enabled."""
-    # Set env vars in broker's own environment so sudo -E passes them through.
-    for k, v in ENV.items():
-        os.environ[k] = v
-
+    """Launch xemu as abc via sudo env with inline vars to pass LD_PRELOAD."""
     cmd = [
         "sudo",
-        "-E",
         "-u",
         "abc",
-        "--",
+        "env",
+        *[f"{k}={v}" for k, v in ENV.items()],
         XEMU_BIN,
         "-full-screen",
         "-qmp",
@@ -192,11 +181,6 @@ def _launch_xemu_internal(rom_path: str | None) -> None:
 
     log.info("Launching xemu (rom=%s)", rom_path or "dashboard")
     log.debug("_launch_xemu_internal: cmd=%s", " ".join(cmd))
-    log.debug(
-        "_launch_xemu_internal: SDL_JOYSTICK_LINUX_DISABLE_UDEV=%s, LD_PRELOAD=%s",
-        os.environ.get("SDL_JOYSTICK_LINUX_DISABLE_UDEV"),
-        os.environ.get("LD_PRELOAD"),
-    )
 
     try:
         proc = subprocess.Popen(
