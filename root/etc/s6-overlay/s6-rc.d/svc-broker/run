@@ -1,3 +1,3 @@
 #!/usr/bin/with-contenv bash
 # Temporarily disabled for no-broker controller test.
-exit 0
+exec sleep infinity
