@@ -24,21 +24,6 @@ QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 
-# ENV vars passed to xemu via sudo -u abc env with inline assignments.
-# LD_PRELOAD must be passed inline because sudo -E strips LD_* vars (sudo security filter).
-# PULSE_RUNTIME_PATH — required to prevent xemu audio assertion failure.
-ENV = {
-    "DISPLAY": ":0",
-    "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY", "wayland-0"),
-    "XDG_RUNTIME_DIR": "/config/.XDG",
-    "PULSE_RUNTIME_PATH": "/defaults",
-    "DRI_NODE": os.environ.get("DRI_NODE", ""),
-    "DRINODE": os.environ.get("DRINODE", ""),
-    "HOME": "/config",
-    "USER": "abc",
-    "LD_PRELOAD": "/usr/lib/selkies_joystick_interposer.so",
-}
-
 logging.basicConfig(
     level=getattr(
         logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO
@@ -59,6 +44,7 @@ _session: dict = {
     "started_at": None,
     "is_managed": False,
     "save_in_progress": False,
+    "pending_rom_path": None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -84,6 +70,7 @@ def _kill_xemu() -> None:
         _session["rom_path"] = None
         _session["rom_name"] = None
         _session["started_at"] = None
+        _session["pending_rom_path"] = None
 
     if proc is None or proc.poll() is not None:
         log.debug("_kill_xemu: no running process to kill")
@@ -120,21 +107,38 @@ def _log_xemu_output(proc: subprocess.Popen) -> None:
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
 
 
+def _qmp_load_rom(rom_path: str) -> bool:
+    """Eject any currently mounted disc and load a new ROM via QMP."""
+    try:
+        _qmp_command("eject", {"device": "ide1-cd0"})
+        log.debug("QMP: ejected current disc")
+    except (OSError, ValueError):
+        pass
+    try:
+        _qmp_command("change", {"device": "ide1-cd0", "target": rom_path})
+        log.info("QMP: loaded ROM %s", rom_path)
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: change/load failed: %s", exc)
+        return False
+
+
 def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch xemu as abc via sudo env with inline vars to pass LD_PRELOAD."""
+    """Launch xemu as abc from inside the labwc session (no ROM, no LD_PRELOAD)."""
     cmd = [
         "sudo",
         "-u",
         "abc",
         "env",
-        *[f"{k}={v}" for k, v in ENV.items()],
+        "XDG_RUNTIME_DIR=/config/.XDG",
+        "DISPLAY=:0",
+        "WAYLAND_DISPLAY=wayland-0",
+        "HOME=/config",
         XEMU_BIN,
         "-full-screen",
         "-qmp",
         f"unix:{QMP_SOCKET},server,nowait",
     ]
-    if rom_path:
-        cmd.extend(["-dvd_path", rom_path])
 
     log.info("Launching xemu (rom=%s)", rom_path or "dashboard")
     log.debug("_launch_xemu_internal: cmd=%s", " ".join(cmd))
@@ -199,15 +203,43 @@ def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
 
 
 def _launch_xemu(rom_path: str | None) -> None:
-    """Top-level launch: kill any running xemu, launch fresh."""
+    """Top-level launch: kill any running xemu, launch dashboard, inject ROM via QMP if needed."""
     _kill_xemu()
     time.sleep(2)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _session_lock:
-        _session["rom_path"] = rom_path
-        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
+        _session["rom_path"] = None
+        _session["rom_name"] = "Dashboard"
         _session["started_at"] = started_at
-    _launch_xemu_internal(rom_path)
+        _session["pending_rom_path"] = rom_path
+    _launch_xemu_internal(None)
+
+    if rom_path:
+        Thread(target=_wait_and_load_rom, args=(rom_path,), daemon=True).start()
+
+
+def _wait_and_load_rom(rom_path: str) -> None:
+    """Wait for xemu to boot, then inject the ROM via QMP."""
+    time.sleep(12)
+    with _session_lock:
+        if _session["pending_rom_path"] != rom_path:
+            log.debug("_wait_and_load_rom: pending_rom_path changed — skipping load")
+            return
+        proc = _session["process"]
+    if proc is None or proc.poll() is not None:
+        log.debug("_wait_and_load_rom: xemu already exited — skipping")
+        return
+    ok = _qmp_load_rom(rom_path)
+    if ok:
+        with _session_lock:
+            _session["rom_path"] = rom_path
+            _session["rom_name"] = Path(rom_path).stem
+            _session["pending_rom_path"] = None
+        log.info("ROM loaded: %s", Path(rom_path).stem)
+    else:
+        with _session_lock:
+            _session["pending_rom_path"] = None
+        log.warning("Failed to load ROM via QMP — xemu showing dashboard")
 
 
 # ── QMP helpers ───────────────────────────────────────────────────────────────
@@ -573,11 +605,6 @@ def main():
         log.warning(
             "BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated"
         )
-
-    log.debug(
-        "Startup ENV: %s",
-        {k: ("***" if k == "BROKER_SECRET" else v) for k, v in ENV.items()},
-    )
 
     time.sleep(5)
 
