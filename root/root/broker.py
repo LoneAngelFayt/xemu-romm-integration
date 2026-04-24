@@ -104,7 +104,7 @@ def _log_xemu_output(proc: subprocess.Popen) -> None:
         log.debug("_log_xemu_output: reader exited: %s", exc)
 
 
-XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
+XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 SELKIES_INTERPOSER = os.environ.get("SELKIES_INTERPOSER", "/usr/lib/selkies_joystick_interposer.so")
 FAKE_LIBUDEV = "/opt/lib/libudev.so.1.0.0-fake"
