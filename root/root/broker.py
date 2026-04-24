@@ -105,6 +105,19 @@ def _log_xemu_output(proc: subprocess.Popen) -> None:
 
 
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
+XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
+SELKIES_INTERPOSER = os.environ.get("SELKIES_INTERPOSER", "/usr/lib/selkies_joystick_interposer.so")
+FAKE_LIBUDEV = "/opt/lib/libudev.so.1.0.0-fake"
+
+
+def _wayland_display() -> str:
+    """Return the active Wayland display name by scanning XDG_RUNTIME_DIR."""
+    sockets = [
+        Path(p).name
+        for p in glob.glob(f"{XDG_RUNTIME_DIR}/wayland-*")
+        if not p.endswith(".lock")
+    ]
+    return sockets[0] if sockets else "wayland-0"
 
 
 def _qmp_load_rom(rom_path: str) -> bool:
@@ -124,18 +137,20 @@ def _qmp_load_rom(rom_path: str) -> bool:
 
 
 def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch xemu as abc from inside the labwc session (no ROM, no LD_PRELOAD)."""
+    """Launch xemu as abc from inside the labwc session."""
+    ld_preload = f"{SELKIES_INTERPOSER}:{FAKE_LIBUDEV}"
     cmd = [
         "sudo",
         "-u",
         "abc",
         "env",
-        "XDG_RUNTIME_DIR=/config/.XDG",
-        "DISPLAY=:0",
-        "WAYLAND_DISPLAY=wayland-0",
+        f"XDG_RUNTIME_DIR={XDG_RUNTIME_DIR}",
+        f"DISPLAY={os.environ.get('DISPLAY', ':1')}",
+        f"WAYLAND_DISPLAY={_wayland_display()}",
         "HOME=/config",
         "SDL_AUDIODRIVER=pulse",
         "PULSE_RUNTIME_PATH=/defaults",
+        f"LD_PRELOAD={ld_preload}",
         XEMU_BIN,
         "-full-screen",
         "-qmp",
