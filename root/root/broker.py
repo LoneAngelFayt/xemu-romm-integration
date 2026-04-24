@@ -104,7 +104,7 @@ def _log_xemu_output(proc: subprocess.Popen) -> None:
         log.debug("_log_xemu_output: reader exited: %s", exc)
 
 
-XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
+XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
 
 
 def _qmp_load_rom(rom_path: str) -> bool:
