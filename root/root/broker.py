@@ -134,6 +134,8 @@ def _launch_xemu_internal(rom_path: str | None) -> None:
         "DISPLAY=:0",
         "WAYLAND_DISPLAY=wayland-0",
         "HOME=/config",
+        "SDL_AUDIODRIVER=pulse",
+        "PULSE_RUNTIME_PATH=/defaults",
         XEMU_BIN,
         "-full-screen",
         "-qmp",
