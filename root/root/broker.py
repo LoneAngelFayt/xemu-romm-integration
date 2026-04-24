@@ -136,6 +136,7 @@ def _launch_xemu_internal(rom_path: str | None) -> None:
         "HOME=/config",
         "SDL_AUDIODRIVER=pulse",
         "PULSE_RUNTIME_PATH=/defaults",
+        "LD_PRELOAD=/usr/lib/selkies_joystick_interposer.so",
         XEMU_BIN,
         "-full-screen",
         "-qmp",
