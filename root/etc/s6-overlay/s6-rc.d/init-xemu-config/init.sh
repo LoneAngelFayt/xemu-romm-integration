@@ -22,12 +22,11 @@ if [ "$_need_apt" = "1" ]; then
 fi
 
 # ── Disable labwc autostart ───────────────────────────────────────────────────
-# Prevents xemu from being launched a second time by the desktop session —
-# the broker manages the process lifecycle directly.
-AUTOSTART="/config/.config/labwc/autostart"
-mkdir -p "$(dirname "$AUTOSTART")"
-printf '# Disabled by xemu-broker-mod\n' > "$AUTOSTART"
-echo "[xemu-broker-mod] Disabled labwc autostart."
+# Temporarily disabled for no-broker controller test.
+# AUTOSTART="/config/.config/labwc/autostart"
+# mkdir -p "$(dirname "$AUTOSTART")"
+# printf '# Disabled by xemu-broker-mod\n' > "$AUTOSTART"
+# echo "[xemu-broker-mod] Disabled labwc autostart."
 
 # ── Seed xemu.toml defaults ──────────────────────────────────────────────────
 # xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.

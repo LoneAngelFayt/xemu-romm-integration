@@ -1,2 +1,3 @@
 #!/usr/bin/with-contenv bash
-exec python3 -u /root/broker.py
+# Temporarily disabled for no-broker controller test.
+exit 0
