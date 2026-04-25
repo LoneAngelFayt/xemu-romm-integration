@@ -5,9 +5,8 @@ XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"
 
 # Clean up stale Wayland and X11 sockets so pixelflux/Xwayland always start on
-# the default indices (wayland-1, :0).  Stale lock files on the host-mapped
-# /config volume cause them to increment on relaunch, breaking the broker's
-# hardcoded display expectations.
+# the default indices. Stale lock files on the host-mapped /config volume cause
+# them to increment on relaunch, breaking hardcoded display expectations.
 find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[xemu-broker-mod] Cleaned up stale display sockets."
@@ -21,13 +20,23 @@ if [ "$_need_apt" = "1" ]; then
         || echo "[xemu-broker-mod] ERROR: apt-get install failed"
 fi
 
-# ── Disable labwc autostart ───────────────────────────────────────────────────
-# Prevents xemu from being launched a second time by the desktop session —
-# the broker manages the process lifecycle directly.
+# ── Patch labwc autostart to expose QMP ──────────────────────────────────────
+# The base image autostart runs: xterm -e /opt/xemu/AppRun
+# We add the -qmp flag so the broker can inject ROMs and manage save states.
+# We only write if the file doesn't already contain the qmp flag, so manual
+# edits to the autostart are preserved across restarts.
 AUTOSTART="/config/.config/labwc/autostart"
 mkdir -p "$(dirname "$AUTOSTART")"
-printf '# Disabled by xemu-broker-mod\n' > "$AUTOSTART"
-echo "[xemu-broker-mod] Disabled labwc autostart."
+
+QMP_SOCKET="/tmp/xemu-qmp.sock"
+QMP_FLAG="-qmp unix:${QMP_SOCKET},server,nowait"
+
+if [ ! -f "$AUTOSTART" ] || ! grep -q "xemu-qmp" "$AUTOSTART"; then
+    printf '#!/bin/bash\n\n# Run xemu with QMP socket for broker ROM injection\nxterm -e /opt/xemu/AppRun %s\n' "$QMP_FLAG" > "$AUTOSTART"
+    echo "[xemu-broker-mod] Wrote labwc autostart with QMP flag."
+else
+    echo "[xemu-broker-mod] labwc autostart already has QMP flag — skipping."
+fi
 
 # ── Seed xemu.toml defaults ──────────────────────────────────────────────────
 # xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.
@@ -35,8 +44,8 @@ echo "[xemu-broker-mod] Disabled labwc autostart."
 #   [input.bindings]   port1_driver = 'usb-xbox-gamepad'  — always, so a
 #                      fresh container presents port 1 as an SDL gamepad
 #                      without requiring manual UI setup.
-#   [display]          renderer = 'Vulkan'                 — only on AMD GPUs,
-#                      to avoid known bug
+#   [display]          renderer = 'opengl'                 — only on AMD GPUs,
+#                      correcting the invalid 'Vulkan' value if present.
 # Keys are only written if not already present so user edits are preserved.
 XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
 
@@ -44,9 +53,9 @@ _amd_gpu=0
 grep -q '^amdgpu ' /proc/modules 2>/dev/null && _amd_gpu=1
 
 if [ "$_amd_gpu" = "1" ]; then
-    echo "[xemu-broker-mod] AMD GPU detected — will seed Vulkan renderer."
+    echo "[xemu-broker-mod] AMD GPU detected — will seed opengl renderer."
 else
-    echo "[xemu-broker-mod] No AMD GPU detected — skipping Vulkan renderer seed."
+    echo "[xemu-broker-mod] No AMD GPU detected — skipping renderer seed."
 fi
 
 python3 - "$XEMU_CONFIG" "$_amd_gpu" <<'PYEOF'
@@ -62,7 +71,7 @@ text = p.read_text() if p.exists() else ''
 def _seed(txt, section, key, value):
     """Add key=value under section if key is not already present anywhere."""
     if re.search(rf'^\s*{re.escape(key)}\s*=', txt, re.MULTILINE):
-        return txt, False  # already set, preserve user value
+        return txt, False
     section_pat = rf'(^{re.escape(section)}[^\n]*\n)'
     if re.search(section_pat, txt, re.MULTILINE):
         txt = re.sub(section_pat, rf'\g<1>{key} = {value}\n', txt, count=1, flags=re.MULTILINE)
@@ -70,18 +79,22 @@ def _seed(txt, section, key, value):
         txt += f'\n{section}\n{key} = {value}\n'
     return txt, True
 
-changed = False
-
 text, did = _seed(text, '[input.bindings]', 'port1_driver', "'usb-xbox-gamepad'")
 if did:
     print("[xemu-broker-mod] Seeded [input.bindings] port1_driver = 'usb-xbox-gamepad'.")
 
 if amd_gpu:
-    text, did = _seed(text, '[display]', 'renderer', "'Vulkan'")
-    if did:
-        print("[xemu-broker-mod] Seeded [display] renderer = 'Vulkan'.")
+    # Correct invalid 'Vulkan' (rejected by xemu) to 'opengl'.
+    # Also seeds on first run if the key is absent entirely.
+    if re.search(r"^\s*renderer\s*=\s*'Vulkan'\s*$", text, re.MULTILINE):
+        text = re.sub(r"(^\s*renderer\s*=\s*)'Vulkan'", r"\g<1>'opengl'", text, flags=re.MULTILINE)
+        print("[xemu-broker-mod] Corrected [display] renderer from 'Vulkan' to 'opengl'.")
     else:
-        print("[xemu-broker-mod] [display] renderer already set — skipping.")
+        text, did = _seed(text, '[display]', 'renderer', "'opengl'")
+        if did:
+            print("[xemu-broker-mod] Seeded [display] renderer = 'opengl'.")
+        else:
+            print("[xemu-broker-mod] [display] renderer already set — skipping.")
 
 p.write_text(text)
 PYEOF
