@@ -155,26 +155,112 @@ def _qmp_return_to_dashboard() -> bool:
         return False
 
 
-def _qmp_save_state(slot: int) -> bool:
-    name = f"broker-slot-{slot}"
+def _qmp_get_hdd_node() -> str:
+    """Return the block node name for ide0-hd0. Raises ValueError if not found."""
+    r = _qmp_command("query-block")
+    for dev in r.get("return", []):
+        if dev.get("device") == "ide0-hd0":
+            node = dev.get("inserted", {}).get("node-name")
+            if node:
+                return node
+    raise ValueError("ide0-hd0 block node not found")
+
+
+def _qmp_snapshot(cmd: str, tag: str) -> bool:
+    """Run snapshot-save or snapshot-load as an async job; wait for completion."""
     try:
-        _qmp_command("savevm", {"name": name})
-        log.info("QMP: savevm %s complete", name)
-        return True
+        node = _qmp_get_hdd_node()
     except (OSError, ValueError) as exc:
-        log.error("QMP: savevm %s failed: %s", name, exc)
+        log.error("QMP: cannot get HDD node for %s: %s", cmd, exc)
         return False
+
+    job_id = f"broker-{tag}"
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    buf = b""
+
+    def recv_msg():
+        nonlocal buf
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("QMP socket closed")
+            buf += chunk
+        line, _, buf = buf.partition(b"\n")
+        return json.loads(line)
+
+    def send_cmd(execute, args=None):
+        payload = {"execute": execute}
+        if args:
+            payload["arguments"] = args
+        sock.sendall(json.dumps(payload).encode() + b"\n")
+        while True:
+            msg = recv_msg()
+            if "return" in msg:
+                return msg
+            if "error" in msg:
+                raise ValueError(msg["error"].get("desc", str(msg["error"])))
+            # async event — keep draining
+
+    try:
+        sock.settimeout(QMP_TIMEOUT)
+        sock.connect(str(QMP_SOCKET))
+        recv_msg()  # greeting
+        sock.settimeout(QMP_WAIT)
+        send_cmd("qmp_capabilities")
+        send_cmd(cmd, {"job-id": job_id, "tag": tag, "vmstate": node, "devices": [node]})
+
+        # Wait for the job to conclude
+        deadline = time.monotonic() + QMP_WAIT
+        while time.monotonic() < deadline:
+            msg = recv_msg()
+            if (msg.get("event") == "JOB_STATUS_CHANGE"
+                    and msg.get("data", {}).get("id") == job_id
+                    and msg.get("data", {}).get("status") == "concluded"):
+                break
+        else:
+            raise OSError("Snapshot job timed out")
+
+        jobs = send_cmd("query-jobs")
+        error = None
+        for job in jobs.get("return", []):
+            if job.get("id") == job_id:
+                error = job.get("error")
+                break
+
+        try:
+            send_cmd("job-dismiss", {"id": job_id})
+        except (OSError, ValueError):
+            pass
+
+        if error:
+            raise ValueError(error)
+        return True
+
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.error("QMP: %s %s failed: %s", cmd, tag, exc)
+        return False
+    finally:
+        sock.close()
+
+
+def _qmp_save_state(slot: int) -> bool:
+    tag = f"broker-slot-{slot}"
+    ok = _qmp_snapshot("snapshot-save", tag)
+    if ok:
+        log.info("QMP: snapshot saved %s", tag)
+    else:
+        log.error("QMP: snapshot save %s failed", tag)
+    return ok
 
 
 def _qmp_load_state(slot: int) -> bool:
-    name = f"broker-slot-{slot}"
-    try:
-        _qmp_command("loadvm", {"name": name})
-        log.info("QMP: loadvm %s complete", name)
-        return True
-    except (OSError, ValueError) as exc:
-        log.error("QMP: loadvm %s failed: %s", name, exc)
-        return False
+    tag = f"broker-slot-{slot}"
+    ok = _qmp_snapshot("snapshot-load", tag)
+    if ok:
+        log.info("QMP: snapshot loaded %s", tag)
+    else:
+        log.error("QMP: snapshot load %s failed", tag)
+    return ok
 
 
 def _qmp_quit() -> None:
