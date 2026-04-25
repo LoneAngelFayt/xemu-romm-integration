@@ -124,10 +124,15 @@ def _qmp_wait_ready(timeout: float) -> bool:
 def _qmp_load_rom(rom_path: str) -> bool:
     try:
         _qmp_command("blockdev-change-medium", {"device": "ide0-cd1", "filename": rom_path})
-        log.info("QMP: loaded ROM %s", rom_path)
-        return True
     except (OSError, ValueError) as exc:
         log.error("QMP: blockdev-change-medium failed: %s", exc)
+        return False
+    try:
+        _qmp_command("system_reset")
+        log.info("QMP: loaded ROM %s and reset console", rom_path)
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: system_reset failed: %s", exc)
         return False
 
 
