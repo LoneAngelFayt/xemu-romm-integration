@@ -121,19 +121,63 @@ def _qmp_wait_ready(timeout: float) -> bool:
     return False
 
 
+def _qmp_reset_confirmed(retries: int = 3) -> bool:
+    """Send system_reset and wait for the RESET event, retrying on failure."""
+    for attempt in range(1, retries + 1):
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        buf = b""
+
+        def recv_msg():
+            nonlocal buf
+            while b"\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise OSError("QMP socket closed")
+                buf += chunk
+            line, _, buf = buf.partition(b"\n")
+            return json.loads(line)
+
+        try:
+            sock.settimeout(QMP_TIMEOUT)
+            sock.connect(str(QMP_SOCKET))
+            recv_msg()  # greeting
+            sock.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
+            sock.settimeout(QMP_WAIT)
+            # drain return
+            while "return" not in recv_msg():
+                pass
+            sock.sendall(json.dumps({"execute": "system_reset"}).encode() + b"\n")
+            deadline = time.monotonic() + QMP_WAIT
+            while time.monotonic() < deadline:
+                msg = recv_msg()
+                if msg.get("event") == "RESET":
+                    log.debug("QMP: RESET event confirmed (attempt %d)", attempt)
+                    return True
+                if "return" in msg or "error" in msg:
+                    continue
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("QMP: reset attempt %d/%d failed: %s", attempt, retries, exc)
+        finally:
+            sock.close()
+
+        if attempt < retries:
+            time.sleep(0.5)
+
+    log.error("QMP: system_reset not confirmed after %d attempts", retries)
+    return False
+
+
 def _qmp_load_rom(rom_path: str) -> bool:
     try:
         _qmp_command("blockdev-change-medium", {"device": "ide0-cd1", "filename": rom_path})
     except (OSError, ValueError) as exc:
         log.error("QMP: blockdev-change-medium failed: %s", exc)
         return False
-    try:
-        _qmp_command("system_reset")
-        log.info("QMP: loaded ROM %s and reset console", rom_path)
+    if _qmp_reset_confirmed():
+        log.info("QMP: loaded ROM %s and reset confirmed", rom_path)
         return True
-    except (OSError, ValueError) as exc:
-        log.error("QMP: system_reset failed: %s", exc)
-        return False
+    log.error("QMP: reset not confirmed after loading ROM %s", rom_path)
+    return False
 
 
 def _qmp_return_to_dashboard() -> bool:
@@ -142,13 +186,11 @@ def _qmp_return_to_dashboard() -> bool:
         _qmp_command("eject", {"device": "ide0-cd1"})
     except (OSError, ValueError):
         pass
-    try:
-        _qmp_command("system_reset")
+    if _qmp_reset_confirmed():
         log.info("QMP: disc ejected and console reset to dashboard")
         return True
-    except (OSError, ValueError) as exc:
-        log.error("QMP: system_reset failed: %s", exc)
-        return False
+    log.error("QMP: reset not confirmed returning to dashboard")
+    return False
 
 
 def _qmp_get_hdd_node() -> str:
