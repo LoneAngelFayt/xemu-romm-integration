@@ -123,15 +123,11 @@ def _qmp_wait_ready(timeout: float) -> bool:
 
 def _qmp_load_rom(rom_path: str) -> bool:
     try:
-        _qmp_command("eject", {"device": "ide1-cd0"})
-    except (OSError, ValueError):
-        pass
-    try:
-        _qmp_command("change", {"device": "ide1-cd0", "target": rom_path})
+        _qmp_command("blockdev-change-medium", {"device": "ide0-cd1", "filename": rom_path})
         log.info("QMP: loaded ROM %s", rom_path)
         return True
     except (OSError, ValueError) as exc:
-        log.error("QMP: change failed: %s", exc)
+        log.error("QMP: blockdev-change-medium failed: %s", exc)
         return False
 
 
