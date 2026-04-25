@@ -139,11 +139,7 @@ def _qmp_load_rom(rom_path: str) -> bool:
 def _qmp_return_to_dashboard() -> bool:
     """Eject the disc and reset — xemu boots back to the Xbox dashboard."""
     try:
-        _qmp_command("blockdev-open-tray", {"device": "ide0-cd1"})
-    except (OSError, ValueError):
-        pass
-    try:
-        _qmp_command("blockdev-remove-medium", {"device": "ide0-cd1"})
+        _qmp_command("eject", {"device": "ide0-cd1"})
     except (OSError, ValueError):
         pass
     try:
