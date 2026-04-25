@@ -99,6 +99,10 @@ if amd_gpu:
 p.write_text(text)
 PYEOF
 
+# ── Fix ownership so xemu (running as abc) can write its config ───────────────
+chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null || true
+echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."
+
 # ── Input device name diagnostic (DEBUG only) ────────────────────────────────
 if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
     echo "[xemu-broker-mod] Input device names (for SDL controller mapping):"
