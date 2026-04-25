@@ -136,6 +136,25 @@ def _qmp_load_rom(rom_path: str) -> bool:
         return False
 
 
+def _qmp_return_to_dashboard() -> bool:
+    """Eject the disc and reset — xemu boots back to the Xbox dashboard."""
+    try:
+        _qmp_command("blockdev-open-tray", {"device": "ide0-cd1"})
+    except (OSError, ValueError):
+        pass
+    try:
+        _qmp_command("blockdev-remove-medium", {"device": "ide0-cd1"})
+    except (OSError, ValueError):
+        pass
+    try:
+        _qmp_command("system_reset")
+        log.info("QMP: disc ejected and console reset to dashboard")
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: system_reset failed: %s", exc)
+        return False
+
+
 def _qmp_save_state(slot: int) -> bool:
     name = f"broker-slot-{slot}"
     try:
@@ -356,8 +375,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 try:
                     ok = _qmp_save_state(10)
                     if not ok:
-                        log.warning("save-and-exit: save failed — quitting anyway")
-                    _qmp_quit()
+                        log.warning("save-and-exit: save failed — returning to dashboard anyway")
+                    _qmp_return_to_dashboard()
                 finally:
                     with _lock:
                         _state["save_in_progress"] = False
@@ -403,11 +422,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden"})
             return
         if self.path == "/launch":
+            _qmp_return_to_dashboard()
             with _lock:
                 _state["rom_path"] = None
                 _state["rom_name"] = None
                 _state["started_at"] = None
-            log.info("State cleared via DELETE /launch")
+            log.info("Disc ejected and returned to dashboard via DELETE /launch")
             self._send_json(200, {"status": "ok"})
             return
         self._send_json(404, {"error": "not found"})
