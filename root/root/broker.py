@@ -241,6 +241,7 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
 
 def _qmp_save_state(slot: int) -> bool:
     tag = f"broker-slot-{slot}"
+    _qmp_snapshot("snapshot-delete", tag)  # remove stale snapshot; ignore failure
     ok = _qmp_snapshot("snapshot-save", tag)
     if ok:
         log.info("QMP: snapshot saved %s", tag)
