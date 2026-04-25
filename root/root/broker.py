@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""broker.py — launch xemu on demand and expose a small HTTP API."""
+"""broker.py — QMP shim for xemu ROM injection and save-state management."""
 
-import glob
 import hmac
 import json
 import logging
 import os
-import signal
 import socket as _socket
 import subprocess
 import sys
@@ -23,6 +21,7 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
+QMP_BOOT_TIMEOUT = float(os.environ.get("QMP_BOOT_TIMEOUT", "60.0"))
 
 logging.basicConfig(
     level=getattr(
@@ -36,22 +35,18 @@ log = logging.getLogger("broker")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-_session_lock = Lock()
-_session: dict = {
-    "process": None,
+_lock = Lock()
+_state: dict = {
     "rom_path": None,
     "rom_name": None,
     "started_at": None,
-    "is_managed": False,
     "save_in_progress": False,
-    "pending_rom_path": None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _validate_rom_path(raw: str) -> Path | None:
-    """Resolve raw to an absolute path and confirm it lives under ROM_ROOT."""
     try:
         p = Path(raw).resolve()
     except (ValueError, OSError):
@@ -61,215 +56,13 @@ def _validate_rom_path(raw: str) -> Path | None:
     return p
 
 
-def _kill_xemu() -> None:
-    """Kill the managed xemu process group. Releases lock before waiting."""
-    with _session_lock:
-        _session["is_managed"] = False
-        proc = _session["process"]
-        _session["process"] = None
-        _session["rom_path"] = None
-        _session["rom_name"] = None
-        _session["started_at"] = None
-        _session["pending_rom_path"] = None
-
-    if proc is None or proc.poll() is not None:
-        log.debug("_kill_xemu: no running process to kill")
-        return
-
-    log.info("Stopping xemu (PID %d)...", proc.pid)
-    try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
-        log.debug("_kill_xemu: SIGTERM sent to pgid %d", pgid)
-        try:
-            proc.wait(timeout=5)
-            log.debug("_kill_xemu: process exited cleanly after SIGTERM")
-        except subprocess.TimeoutExpired:
-            log.warning("xemu did not exit after SIGTERM — sending SIGKILL")
-            os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
-            log.debug("_kill_xemu: process killed with SIGKILL")
-    except ProcessLookupError:
-        log.debug("_kill_xemu: process already gone")
-
-
-def _log_xemu_output(proc: subprocess.Popen) -> None:
-    """Read xemu stdout/stderr line-by-line and emit as [xemu] DEBUG log entries."""
-    try:
-        for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            if line:
-                log.debug("[xemu] %s", line)
-    except Exception as exc:
-        log.debug("_log_xemu_output: reader exited: %s", exc)
-
-
-XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/usr/bin/xemu")
-XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
-SELKIES_INTERPOSER = os.environ.get("SELKIES_INTERPOSER", "/usr/lib/selkies_joystick_interposer.so")
-FAKE_LIBUDEV = os.environ.get("FAKE_LIBUDEV", "/opt/lib/libudev.so.1.0.0-fake")
-
-
-def _wayland_display() -> str:
-    """Return the active Wayland display name by scanning XDG_RUNTIME_DIR."""
-    sockets = [
-        Path(p).name
-        for p in glob.glob(f"{XDG_RUNTIME_DIR}/wayland-*")
-        if not p.endswith(".lock")
-    ]
-    return sockets[0] if sockets else "wayland-0"
-
-
-def _qmp_load_rom(rom_path: str) -> bool:
-    """Eject any currently mounted disc and load a new ROM via QMP."""
-    try:
-        _qmp_command("eject", {"device": "ide1-cd0"})
-        log.debug("QMP: ejected current disc")
-    except (OSError, ValueError):
-        pass
-    try:
-        _qmp_command("change", {"device": "ide1-cd0", "target": rom_path})
-        log.info("QMP: loaded ROM %s", rom_path)
-        return True
-    except (OSError, ValueError) as exc:
-        log.error("QMP: change/load failed: %s", exc)
-        return False
-
-
-def _launch_xemu_internal(rom_path: str | None) -> None:
-    """Launch xemu as abc from inside the labwc session."""
-    cmd = [
-        "sudo",
-        "-u",
-        "abc",
-        "env",
-        f"XDG_RUNTIME_DIR={XDG_RUNTIME_DIR}",
-        "DISPLAY=:0",
-        f"WAYLAND_DISPLAY={_wayland_display()}",
-        "HOME=/config",
-        "SDL_AUDIODRIVER=pulse",
-        "PULSE_RUNTIME_PATH=/defaults",
-        f"LD_PRELOAD={SELKIES_INTERPOSER}:{FAKE_LIBUDEV}",
-        "LD_LIBRARY_PATH=/opt/xemu/usr/lib",
-        XEMU_BIN,
-        "-full-screen",
-        "-qmp",
-        f"unix:{QMP_SOCKET},server,nowait",
-    ]
-
-    log.info("Launching xemu (rom=%s)", rom_path or "dashboard")
-    log.debug("_launch_xemu_internal: cmd=%s", " ".join(cmd))
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setpgrp,
-        )
-    except Exception as exc:
-        log.error("_launch_xemu_internal: failed to launch xemu: %s", exc)
-        with _session_lock:
-            _session["process"] = None
-            _session["is_managed"] = False
-        return
-
-    with _session_lock:
-        _session["process"] = proc
-        _session["is_managed"] = True
-    log.info("xemu launched (PID %d)", proc.pid)
-    Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
-    Thread(target=_log_xemu_output, args=(proc,), daemon=True).start()
-
-
-def _monitor_process(proc: subprocess.Popen, start_time: float) -> None:
-    """On unexpected exit, relaunch the dashboard if the session is still managed."""
-    proc.wait()
-    exit_code = proc.returncode
-    duration = time.monotonic() - start_time
-    log.debug(
-        "_monitor_process: xemu exited (code=%s, duration=%.1fs)",
-        exit_code,
-        duration,
-    )
-
-    with _session_lock:
-        should_relaunch = _session["is_managed"] and _session["process"] is proc
-
-    if not should_relaunch:
-        log.debug("_monitor_process: managed=False or proc replaced — not relaunching")
-        return
-
-    wait_time = 5 if duration < 5 else 1  # longer delay for quick crashes
-    log.info(
-        "xemu exited after %.1fs (code=%s) — relaunching dashboard in %ds",
-        duration,
-        exit_code,
-        wait_time,
-    )
-    time.sleep(wait_time)
-
-    with _session_lock:
-        if not _session["is_managed"]:
-            log.debug(
-                "_monitor_process: managed cleared during sleep — aborting relaunch"
-            )
-            return
-
-    _launch_xemu(None)
-
-
-def _launch_xemu(rom_path: str | None) -> None:
-    """Top-level launch: kill any running xemu, launch dashboard, inject ROM via QMP if needed."""
-    _kill_xemu()
-    time.sleep(2)
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with _session_lock:
-        _session["rom_path"] = None
-        _session["rom_name"] = "Dashboard"
-        _session["started_at"] = started_at
-        _session["pending_rom_path"] = rom_path
-    _launch_xemu_internal(None)
-
-    if rom_path:
-        Thread(target=_wait_and_load_rom, args=(rom_path,), daemon=True).start()
-
-
-def _wait_and_load_rom(rom_path: str) -> None:
-    """Wait for xemu to boot, then inject the ROM via QMP."""
-    time.sleep(12)
-    with _session_lock:
-        if _session["pending_rom_path"] != rom_path:
-            log.debug("_wait_and_load_rom: pending_rom_path changed — skipping load")
-            return
-        proc = _session["process"]
-    if proc is None or proc.poll() is not None:
-        log.debug("_wait_and_load_rom: xemu already exited — skipping")
-        return
-    ok = _qmp_load_rom(rom_path)
-    if ok:
-        with _session_lock:
-            _session["rom_path"] = rom_path
-            _session["rom_name"] = Path(rom_path).stem
-            _session["pending_rom_path"] = None
-        log.info("ROM loaded: %s", Path(rom_path).stem)
-    else:
-        with _session_lock:
-            _session["pending_rom_path"] = None
-        log.warning("Failed to load ROM via QMP — xemu showing dashboard")
-
-
-# ── QMP helpers ───────────────────────────────────────────────────────────────
+# ── QMP ───────────────────────────────────────────────────────────────────────
 
 
 def _qmp_command(cmd: str, args: dict | None = None) -> dict:
     """Open a fresh QMP connection, negotiate capabilities, send one command.
 
-    The connection is closed after the response is received.
-    QMP savevm/loadvm block until the operation completes, so QMP_WAIT is used
-    as the socket timeout for the command response.
-
-    Raises OSError if the socket is unavailable or the connection fails.
+    Raises OSError if the socket is unavailable.
     Raises ValueError if QMP returns an error response.
     """
     payload: dict = {"execute": cmd}
@@ -292,15 +85,9 @@ def _qmp_command(cmd: str, args: dict | None = None) -> dict:
     try:
         sock.settimeout(QMP_TIMEOUT)
         sock.connect(str(QMP_SOCKET))
-
-        # 1. Read QMP greeting: {"QMP": {"version": {...}, "capabilities": [...]}}
-        recv_line()
-
-        # 2. Negotiate capabilities
+        recv_line()  # greeting
         sock.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
         recv_line()  # {"return": {}}
-
-        # 3. Send command. savevm/loadvm may block for several seconds.
         sock.settimeout(QMP_WAIT)
         sock.sendall(json.dumps(payload).encode() + b"\n")
         response = recv_line()
@@ -316,8 +103,39 @@ def _qmp_command(cmd: str, args: dict | None = None) -> dict:
     return response
 
 
+def _qmp_available() -> bool:
+    try:
+        _qmp_command("query-status")
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _qmp_wait_ready(timeout: float) -> bool:
+    """Poll QMP until available or timeout. Returns True if ready."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _qmp_available():
+            return True
+        time.sleep(1.0)
+    return False
+
+
+def _qmp_load_rom(rom_path: str) -> bool:
+    try:
+        _qmp_command("eject", {"device": "ide1-cd0"})
+    except (OSError, ValueError):
+        pass
+    try:
+        _qmp_command("change", {"device": "ide1-cd0", "target": rom_path})
+        log.info("QMP: loaded ROM %s", rom_path)
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: change failed: %s", exc)
+        return False
+
+
 def _qmp_save_state(slot: int) -> bool:
-    """Save game state to broker-slot-N via QMP. Returns True on success."""
     name = f"broker-slot-{slot}"
     try:
         _qmp_command("savevm", {"name": name})
@@ -329,7 +147,6 @@ def _qmp_save_state(slot: int) -> bool:
 
 
 def _qmp_load_state(slot: int) -> bool:
-    """Load game state from broker-slot-N via QMP. Returns True on success."""
     name = f"broker-slot-{slot}"
     try:
         _qmp_command("loadvm", {"name": name})
@@ -340,31 +157,49 @@ def _qmp_load_state(slot: int) -> bool:
         return False
 
 
-# ── PulseAudio helpers ────────────────────────────────────────────────────────
+def _qmp_quit() -> None:
+    try:
+        _qmp_command("quit")
+    except (OSError, ValueError):
+        pass
+
+
+# ── ROM loading (background) ──────────────────────────────────────────────────
+
+
+def _do_load_rom(rom_path: str) -> None:
+    """Wait for QMP, inject ROM, update state. Runs in a background thread."""
+    log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
+    if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
+        log.error("QMP not available after %.0fs — ROM load aborted", QMP_BOOT_TIMEOUT)
+        return
+
+    ok = _qmp_load_rom(rom_path)
+    with _lock:
+        if ok:
+            _state["rom_path"] = rom_path
+            _state["rom_name"] = Path(rom_path).stem
+            _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ── PulseAudio ────────────────────────────────────────────────────────────────
 
 _PACTL_CMD = [
-    "sudo",
-    "-u",
-    "abc",
-    "env",
-    "PULSE_RUNTIME_PATH=/defaults",
-    "HOME=/config",
-    "USER=abc",
+    "sudo", "-u", "abc",
+    "env", "PULSE_RUNTIME_PATH=/defaults", "HOME=/config", "USER=abc",
 ]
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    """Run pactl as abc so it connects to abc's PulseAudio instance."""
-    cmd = _PACTL_CMD + ["pactl"] + list(args)
-    log.debug("_pactl: cmd=%s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    return subprocess.run(
+        _PACTL_CMD + ["pactl"] + list(args),
+        capture_output=True, text=True, timeout=5,
+    )
 
 
 def _pactl_get_mute() -> bool | None:
-    """Return current mute state as bool, or None on error."""
     result = _pactl("get-sink-mute", "@DEFAULT_SINK@")
     if result.returncode != 0:
-        log.error("_pactl_get_mute: pactl failed: %s", result.stderr.strip())
         return None
     return result.stdout.strip().endswith("yes")
 
@@ -380,8 +215,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not SECRET:
             return True
         return hmac.compare_digest(
-            self.headers.get("X-Broker-Secret", ""),
-            SECRET,
+            self.headers.get("X-Broker-Secret", ""), SECRET
         )
 
     def _send_json(self, code: int, body: dict) -> None:
@@ -392,7 +226,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
-        log.debug("HTTP response: %d %s", code, body)
 
     def _read_body(self) -> dict:
         try:
@@ -406,113 +239,94 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
+        self.end_headers()
+
     def do_GET(self):
-        log.debug("HTTP GET %s", self.path)
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
-        elif self.path == "/status":
-            with _session_lock:
-                active = (
-                    _session["process"] is not None
-                    and _session["process"].poll() is None
-                    and _session["rom_path"] is not None
-                )
-                rom_path = _session["rom_path"] if active else None
-                rom_name = _session["rom_name"] if active else None
-                started_at = _session["started_at"] if active else None
-            self._send_json(
-                200,
-                {
-                    "active": active,
-                    "rom_path": rom_path,
-                    "rom_name": rom_name,
-                    "started_at": started_at,
-                },
-            )
-        else:
-            self._send_json(404, {"error": "not found"})
+            return
+
+        if self.path == "/status":
+            xemu_up = _qmp_available()
+            with _lock:
+                rom_path = _state["rom_path"]
+                rom_name = _state["rom_name"]
+                started_at = _state["started_at"]
+            self._send_json(200, {
+                "xemu_running": xemu_up,
+                "active": xemu_up and rom_path is not None,
+                "rom_path": rom_path,
+                "rom_name": rom_name,
+                "started_at": started_at,
+            })
+            return
+
+        self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        log.debug("HTTP POST %s", self.path)
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
 
-        if self.path == "/save-and-exit":
-            with _session_lock:
-                if _session["rom_path"] is None:
-                    self._send_json(409, {"error": "no game is running"})
-                    return
-                if _session["save_in_progress"]:
-                    self._send_json(409, {"error": "save already in progress"})
-                    return
-                _session["save_in_progress"] = True
+        if self.path == "/launch":
             body = self._read_body()
-            wait = body.get("wait", True)
-            if wait:
-                try:
-                    ok = _qmp_save_state(10)
-                finally:
-                    with _session_lock:
-                        _session["save_in_progress"] = False
-                if not ok:
-                    log.warning("save-and-exit: QMP save failed — exiting anyway")
-                _kill_xemu()
-                self._send_json(200, {"status": "ok", "saved": ok})
-                Thread(target=_launch_xemu, args=(None,), daemon=True).start()
-            else:
-
-                def _bg():
-                    try:
-                        ok = _qmp_save_state(10)
-                    finally:
-                        with _session_lock:
-                            _session["save_in_progress"] = False
-                    if not ok:
-                        log.warning("save-and-exit: QMP save failed — exiting anyway")
-                    _kill_xemu()
-                    _launch_xemu(None)
-
-                Thread(target=_bg, daemon=True).start()
-                self._send_json(200, {"status": "queued", "saved": False})
+            raw_path = body.get("rom_path", "").strip()
+            if not raw_path:
+                self._send_json(400, {"error": "rom_path is required"})
+                return
+            rom_path = _validate_rom_path(raw_path)
+            if rom_path is None:
+                self._send_json(400, {
+                    "error": "rom_path must be within ROM_ROOT",
+                    "rom_root": str(ROM_ROOT),
+                })
+                return
+            if not rom_path.exists():
+                self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
+                return
+            Thread(target=_do_load_rom, args=(str(rom_path),), daemon=True).start()
+            self._send_json(200, {"status": "loading", "rom_path": str(rom_path)})
             return
 
         if self.path == "/save-state":
-            with _session_lock:
-                if _session["rom_path"] is None:
+            with _lock:
+                if _state["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
-                if _session["save_in_progress"]:
+                if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save already in progress"})
                     return
-                _session["save_in_progress"] = True
+                _state["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 9):
-                with _session_lock:
-                    _session["save_in_progress"] = False
+                with _lock:
+                    _state["save_in_progress"] = False
                 self._send_json(400, {"error": "slot must be 1–9"})
                 return
 
             def _bg_save(s):
                 try:
-                    ok = _qmp_save_state(s)
+                    _qmp_save_state(s)
                 finally:
-                    with _session_lock:
-                        _session["save_in_progress"] = False
-                if not ok:
-                    log.warning("save-state: QMP save failed for slot %d", s)
+                    with _lock:
+                        _state["save_in_progress"] = False
 
             Thread(target=_bg_save, args=(slot,), daemon=True).start()
             self._send_json(200, {"status": "saving", "slot": slot})
             return
 
         if self.path == "/load-state":
-            with _session_lock:
-                if _session["rom_path"] is None:
+            with _lock:
+                if _state["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
-                if _session["save_in_progress"]:
+                if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save in progress"})
                     return
             body = self._read_body()
@@ -527,6 +341,33 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/save-and-exit":
+            with _lock:
+                if _state["rom_path"] is None:
+                    self._send_json(409, {"error": "no game is running"})
+                    return
+                if _state["save_in_progress"]:
+                    self._send_json(409, {"error": "save already in progress"})
+                    return
+                _state["save_in_progress"] = True
+
+            def _bg_exit():
+                try:
+                    ok = _qmp_save_state(10)
+                    if not ok:
+                        log.warning("save-and-exit: save failed — quitting anyway")
+                    _qmp_quit()
+                finally:
+                    with _lock:
+                        _state["save_in_progress"] = False
+                        _state["rom_path"] = None
+                        _state["rom_name"] = None
+                        _state["started_at"] = None
+
+            Thread(target=_bg_exit, daemon=True).start()
+            self._send_json(200, {"status": "queued"})
+            return
+
         if self.path == "/volume":
             body = self._read_body()
             level = body.get("level")
@@ -535,11 +376,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
             result = _pactl("set-sink-volume", "@DEFAULT_SINK@", f"{level}%")
             if result.returncode != 0:
-                self._send_json(
-                    500, {"error": "pactl failed", "detail": result.stderr.strip()}
-                )
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
                 return
-            log.info("Volume set to %d%%", level)
             self._send_json(200, {"status": "ok", "level": level})
             return
 
@@ -551,91 +389,36 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 mute_arg = "toggle"
             result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
             if result.returncode != 0:
-                self._send_json(
-                    500, {"error": "pactl failed", "detail": result.stderr.strip()}
-                )
+                self._send_json(500, {"error": "pactl failed", "detail": result.stderr.strip()})
                 return
             mute_state = _pactl_get_mute()
-            log.info("Mute %s", "on" if mute_state else "off")
             self._send_json(200, {"status": "ok", "mute": mute_state})
             return
 
-        if self.path != "/launch":
-            self._send_json(404, {"error": "not found"})
-            return
-
-        body = self._read_body()
-        raw_path = body.get("rom_path", "").strip()
-
-        if not raw_path:
-            self._send_json(400, {"error": "rom_path is required"})
-            return
-
-        rom_path = _validate_rom_path(raw_path)
-        if rom_path is None:
-            self._send_json(
-                400,
-                {
-                    "error": "rom_path must be within ROM_ROOT",
-                    "rom_root": str(ROM_ROOT),
-                },
-            )
-            return
-        if not rom_path.exists():
-            self._send_json(
-                422, {"error": "rom_path does not exist", "path": str(rom_path)}
-            )
-            return
-
-        Thread(target=_launch_xemu, args=(str(rom_path),), daemon=True).start()
-        self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+        self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self):
-        log.debug("HTTP DELETE %s", self.path)
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
-        if self.path != "/launch":
-            self._send_json(404, {"error": "not found"})
+        if self.path == "/launch":
+            with _lock:
+                _state["rom_path"] = None
+                _state["rom_name"] = None
+                _state["started_at"] = None
+            log.info("State cleared via DELETE /launch")
+            self._send_json(200, {"status": "ok"})
             return
-
-        Thread(target=_launch_xemu, args=(None,), daemon=True).start()
-        log.info("Soft reset: returning to dashboard")
-        self._send_json(200, {"status": "resetting"})
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header(
-            "Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret"
-        )
-        self.end_headers()
+        self._send_json(404, {"error": "not found"})
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
 def main():
-    log.info("Broker starting — waiting 5s for desktop to initialise...")
+    log.info("Broker starting on port %d", PORT)
     if not SECRET:
-        log.warning(
-            "BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated"
-        )
-
-    time.sleep(5)
-
-    # Kill any stale xemu from a previous broker run (SIGTERM first, then SIGKILL).
-    result = subprocess.run(["pkill", "-15", "-x", "xemu"], capture_output=True)
-    if result.returncode == 0:
-        log.info("Sent SIGTERM to stale xemu instance(s) on startup.")
-        time.sleep(3)
-        subprocess.run(["pkill", "-9", "-x", "xemu"], capture_output=True)
-        time.sleep(1)
-    QMP_SOCKET.unlink(missing_ok=True)
-
-    # Auto-launch xemu so the stream shows something while no game is running.
-    Thread(target=_launch_xemu, args=(None,), daemon=True).start()
+        log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
 
     server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("xemu broker listening on port %d", PORT)
