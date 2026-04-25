@@ -203,7 +203,10 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
         recv_msg()  # greeting
         sock.settimeout(QMP_WAIT)
         send_cmd("qmp_capabilities")
-        send_cmd(cmd, {"job-id": job_id, "tag": tag, "vmstate": node, "devices": [node]})
+        args = {"job-id": job_id, "tag": tag, "devices": [node]}
+        if cmd != "snapshot-delete":
+            args["vmstate"] = node
+        send_cmd(cmd, args)
 
         # Wait for the job to conclude
         deadline = time.monotonic() + QMP_WAIT
