@@ -170,7 +170,7 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
         log.error("QMP: cannot get HDD node for %s: %s", cmd, exc)
         return False
 
-    job_id = f"broker-{tag}"
+    job_id = tag
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     buf = b""
 
@@ -203,6 +203,13 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
         recv_msg()  # greeting
         sock.settimeout(QMP_WAIT)
         send_cmd("qmp_capabilities")
+
+        # Dismiss any previously stuck job with this ID before starting
+        try:
+            send_cmd("job-dismiss", {"id": job_id})
+        except (OSError, ValueError):
+            pass
+
         args = {"job-id": job_id, "tag": tag, "devices": [node]}
         if cmd != "snapshot-delete":
             args["vmstate"] = node
@@ -210,13 +217,20 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
 
         # Wait for the job to conclude
         deadline = time.monotonic() + QMP_WAIT
+        concluded = False
         while time.monotonic() < deadline:
             msg = recv_msg()
             if (msg.get("event") == "JOB_STATUS_CHANGE"
                     and msg.get("data", {}).get("id") == job_id
                     and msg.get("data", {}).get("status") == "concluded"):
+                concluded = True
                 break
-        else:
+
+        if not concluded:
+            try:
+                send_cmd("job-cancel", {"id": job_id})
+            except (OSError, ValueError):
+                pass
             raise OSError("Snapshot job timed out")
 
         jobs = send_cmd("query-jobs")
