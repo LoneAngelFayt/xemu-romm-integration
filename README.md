@@ -2,11 +2,11 @@
 
 A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customization/#docker-mods) for [linuxserver/xemu](https://docs.linuxserver.io/images/docker-xemu/) that adds an HTTP broker for [RomM](https://github.com/rommapp/romm) streaming integration.
 
-Enables RomM to launch Xbox original games in a remote streaming session, with save state support, controller input, and volume control — without interfering with how the base image runs xemu.
+Launch original Xbox games from the RomM web UI with save states, controller input, and volume control. The broker communicates with xemu via QMP rather than owning the process, so the base image handles xemu's lifecycle as normal.
 
 ## Prerequisites
 
-xemu requires BIOS files and an Xbox HDD image to function. **These must be configured in the xemu settings UI before launching games via RomM.** Open the container's web interface and configure:
+xemu requires BIOS files and an Xbox HDD image before it will run games. Configure these in the xemu settings UI before launching anything via RomM. Open the container's web interface and set:
 
 - **MCPX boot ROM** — `mcpx_1.0.bin`
 - **Xbox BIOS** — e.g. `complex_4627v1.03.bin`
@@ -77,10 +77,11 @@ All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is 
   "active": true,
   "rom_path": "/romm/library/roms/xbox/Fable.xiso.iso",
   "rom_name": "Fable",
-  "started_at": "2026-04-25T11:50:00Z"
+  "started_at": "2026-04-25T11:50:00Z",
+  "launch_error": null
 }
 ```
-`active` is true only when xemu is reachable via QMP **and** a ROM has been loaded.
+`active` is true only when xemu is reachable via QMP **and** a ROM has been loaded. `launch_error` is `null` on success; after a failed `/launch` it holds the reason (QMP never came up, or the ROM could not be loaded) so the frontend can show why the game never started. It clears at the start of the next launch.
 
 ### Write
 
