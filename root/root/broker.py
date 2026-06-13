@@ -5,11 +5,12 @@ import hmac
 import json
 import logging
 import os
+import signal
 import socket as _socket
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -41,6 +42,7 @@ _state: dict = {
     "rom_name": None,
     "started_at": None,
     "save_in_progress": False,
+    "launch_error": None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -184,8 +186,8 @@ def _qmp_return_to_dashboard() -> bool:
     """Eject the disc and reset — xemu boots back to the Xbox dashboard."""
     try:
         _qmp_command("eject", {"device": "ide0-cd1"})
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as exc:
+        log.warning("QMP: eject failed before reset: %s — disc may still be inserted", exc)
     if _qmp_reset_confirmed():
         log.info("QMP: disc ejected and console reset to dashboard")
         return True
@@ -319,21 +321,20 @@ def _qmp_load_state(slot: int) -> bool:
     return ok
 
 
-def _qmp_quit() -> None:
-    try:
-        _qmp_command("quit")
-    except (OSError, ValueError):
-        pass
-
-
 # ── ROM loading (background) ──────────────────────────────────────────────────
 
 
 def _do_load_rom(rom_path: str) -> None:
     """Wait for QMP, inject ROM, update state. Runs in a background thread."""
+    with _lock:
+        _state["launch_error"] = None
     log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
     if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
         log.error("QMP not available after %.0fs — ROM load aborted", QMP_BOOT_TIMEOUT)
+        with _lock:
+            _state["launch_error"] = (
+                f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — ROM load aborted"
+            )
         return
 
     ok = _qmp_load_rom(rom_path)
@@ -342,6 +343,9 @@ def _do_load_rom(rom_path: str) -> None:
             _state["rom_path"] = rom_path
             _state["rom_name"] = Path(rom_path).stem
             _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        else:
+            _state["launch_error"] = "Failed to load ROM into xemu — see container logs"
+            log.error("ROM load failed for %s", rom_path)
 
 
 # ── PulseAudio ────────────────────────────────────────────────────────────────
@@ -353,15 +357,27 @@ _PACTL_CMD = [
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        _PACTL_CMD + ["pactl"] + list(args),
-        capture_output=True, text=True, timeout=5,
-    )
+    """Run pactl as abc so it connects to abc's PulseAudio instance.
+
+    A hung or missing pactl is reported as a non-zero CompletedProcess (rather
+    than raising) so the /volume and /mute handlers return a 500 instead of
+    dropping the connection with an unhandled exception."""
+    cmd = _PACTL_CMD + ["pactl"] + list(args)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("pactl timed out: %s", " ".join(args))
+        return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
+    except OSError as exc:
+        log.error("pactl failed to run: %s", exc)
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def _pactl_get_mute() -> bool | None:
     result = _pactl("get-sink-mute", "@DEFAULT_SINK@")
     if result.returncode != 0:
+        log.error("pactl get-sink-mute failed (rc=%s): %s",
+                  result.returncode, result.stderr.strip())
         return None
     return result.stdout.strip().endswith("yes")
 
@@ -391,7 +407,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict:
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
             length = 0
         if length == 0:
@@ -419,12 +435,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 rom_path = _state["rom_path"]
                 rom_name = _state["rom_name"]
                 started_at = _state["started_at"]
+                launch_error = _state["launch_error"]
             self._send_json(200, {
                 "xemu_running": xemu_up,
                 "active": xemu_up and rom_path is not None,
                 "rom_path": rom_path,
                 "rom_name": rom_name,
                 "started_at": started_at,
+                "launch_error": launch_error,
             })
             return
 
@@ -491,12 +509,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save in progress"})
                     return
+                # Hold the same flag a save uses: a load is a QMP snapshot job
+                # too, and two concurrent jobs on the shared vmstate corrupt it.
+                _state["save_in_progress"] = True
             body = self._read_body()
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
+                with _lock:
+                    _state["save_in_progress"] = False
                 self._send_json(400, {"error": "slot must be 1–10"})
                 return
-            ok = _qmp_load_state(slot)
+            try:
+                ok = _qmp_load_state(slot)
+            finally:
+                with _lock:
+                    _state["save_in_progress"] = False
             self._send_json(
                 200 if ok else 503,
                 {"status": "ok" if ok else "error", "loaded": ok, "slot": slot},
@@ -578,19 +605,46 @@ class BrokerHandler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
+def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
+    """Stop the HTTP listener and let any in-flight snapshot job finish.
+    Triggered on SIGTERM/SIGINT — serve_forever()'s KeyboardInterrupt path
+    does not cover SIGTERM from s6/systemd. xemu itself is not managed by
+    the broker, so there is no process to kill here."""
+    log.info("Received signal %d — beginning graceful shutdown", signum)
+    Thread(target=server.shutdown, daemon=True).start()
+
+    deadline = time.monotonic() + max(QMP_WAIT, 5.0)
+    while time.monotonic() < deadline:
+        with _lock:
+            if not _state["save_in_progress"]:
+                break
+        time.sleep(0.2)
+    else:
+        log.warning("Shutdown: in-flight snapshot did not conclude within %.1fs", QMP_WAIT)
+    log.info("Shutdown complete")
+
+
 def main():
     log.info("Broker starting on port %d", PORT)
     if not SECRET:
         log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
 
-    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    # ThreadingHTTPServer: snapshot loads run inline in the handler (up to
+    # QMP_WAIT); a single-threaded server would stall /health and /status.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("xemu broker listening on port %d", PORT)
     if SECRET:
         log.info("Shared secret auth enabled")
 
+    def _handle(signum, _frame):
+        _graceful_shutdown(server, signum)
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    finally:
         server.server_close()
 
 
