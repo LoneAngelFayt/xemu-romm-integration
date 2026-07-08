@@ -401,7 +401,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -417,16 +416,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
-        self.end_headers()
-
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+            return
+
+        # /health stays open for container healthchecks; all other GETs
+        # require the shared secret, matching POST/DELETE.
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
             return
 
         if self.path == "/status":
@@ -540,21 +538,41 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     return
                 _state["save_in_progress"] = True
 
-            def _bg_exit():
+            body = self._read_body()
+            slot = body.get("slot", 10)
+            if not isinstance(slot, int) or not (0 <= slot <= 10):
+                with _lock:
+                    _state["save_in_progress"] = False
+                self._send_json(400, {"error": "slot must be 0–10"})
+                return
+            # Slot 0 is a legacy value meaning "use the autosave slot".
+            if slot == 0:
+                slot = 10
+            wait = body.get("wait", True)
+
+            def _save_then_exit(s: int) -> bool:
+                ok = False
                 try:
-                    ok = _qmp_save_state(10)
+                    ok = _qmp_save_state(s)
                     if not ok:
-                        log.warning("save-and-exit: save failed — returning to dashboard anyway")
+                        log.warning("save-and-exit: save failed (slot %d) — returning to dashboard anyway", s)
                     _qmp_return_to_dashboard()
+                except Exception as exc:
+                    log.error("save-and-exit: unexpected error: %s", exc)
                 finally:
                     with _lock:
                         _state["save_in_progress"] = False
                         _state["rom_path"] = None
                         _state["rom_name"] = None
                         _state["started_at"] = None
+                return ok
 
-            Thread(target=_bg_exit, daemon=True).start()
-            self._send_json(200, {"status": "queued"})
+            if wait:
+                ok = _save_then_exit(slot)
+                self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+            else:
+                Thread(target=_save_then_exit, args=(slot,), daemon=True).start()
+                self._send_json(200, {"status": "queued", "slot": slot})
             return
 
         if self.path == "/volume":
