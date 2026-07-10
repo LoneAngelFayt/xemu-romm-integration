@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""broker.py — QMP shim for xemu ROM injection and save-state management."""
+"""broker.py — launch xemu on demand and manage it over QMP.
+
+The broker owns the xemu process lifecycle: it spawns xemu (with the QMP
+socket flag) when a ROM is launched and kills it when the session ends.
+xemu is QEMU-based and busy-loops several CPU cores while idling at the
+dashboard, so no gameless instance is ever kept around."""
 
 import hmac
 import json
@@ -24,6 +29,28 @@ QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 QMP_BOOT_TIMEOUT = float(os.environ.get("QMP_BOOT_TIMEOUT", "60.0"))
 
+# /opt/xemu/AppRun is a symlink to the xemu binary, so the spawned process
+# reports comm "AppRun" (see _reap_stray_xemu).
+XEMU_CMD = os.environ.get("XEMU_CMD", "/opt/xemu/AppRun")
+
+# LD_PRELOAD must include the joystick interposer and the fake libudev or SDL
+# never discovers the synthetic /dev/input/js* devices selkies creates.
+_LD_PRELOAD = (
+    os.environ.get("LD_PRELOAD")
+    or "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"
+)
+
+# Session environment xemu previously inherited from the desktop autostart;
+# now that the broker spawns it, replicated here for sudo -u abc env.
+ENV = {
+    "DISPLAY":            os.environ.get("DISPLAY", ":1"),
+    "XDG_RUNTIME_DIR":    "/config/.XDG",
+    "PULSE_RUNTIME_PATH": "/defaults",
+    "LD_PRELOAD":         _LD_PRELOAD,
+    "HOME":               "/config",
+    "USER":               "abc",
+}
+
 logging.basicConfig(
     level=getattr(
         logging, os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(), logging.INFO
@@ -38,10 +65,12 @@ log = logging.getLogger("broker")
 
 _lock = Lock()
 _state: dict = {
+    "process": None,
     "rom_path": None,
     "rom_name": None,
     "started_at": None,
     "save_in_progress": False,
+    "launch_in_progress": False,  # guards against concurrent /launch requests
     "launch_error": None,
 }
 
@@ -56,6 +85,106 @@ def _validate_rom_path(raw: str) -> Path | None:
     if not p.is_relative_to(ROM_ROOT):
         return None
     return p
+
+
+# ── Process lifecycle ─────────────────────────────────────────────────────────
+
+
+def _wait_for_no_xemu(timeout: float = 3.0) -> bool:
+    """Block until no xemu process remains, up to `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive = False
+        for name in ("AppRun", "xemu"):
+            if subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0:
+                alive = True
+                break
+        if not alive:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _reap_stray_xemu() -> None:
+    """SIGKILL any xemu process the broker does not own.
+
+    An orphaned xemu keeps busy-looping CPU cores and holds the QMP socket
+    path, so strays are reaped at broker startup and before every launch.
+    -x matches the binary name exactly; comm is "AppRun" when spawned via
+    the AppImage symlink, "xemu" if invoked directly.
+    """
+    killed = False
+    for name in ("AppRun", "xemu"):
+        if subprocess.run(["pkill", "-9", "-x", name], capture_output=True).returncode == 0:
+            killed = True
+    if killed:
+        log.info("Reaped stray xemu process(es).")
+        if not _wait_for_no_xemu():
+            log.error("Stray xemu survived SIGKILL; launch may misbehave")
+
+
+def _kill_xemu() -> None:
+    """Kill the managed xemu process group. Lock is released before waiting."""
+    with _lock:
+        proc = _state["process"]
+        _state["process"] = None
+
+    if proc is None or proc.poll() is not None:
+        return
+
+    log.info("Stopping xemu (PID %d)...", proc.pid)
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("xemu did not exit after SIGTERM — sending SIGKILL")
+            os.killpg(pgid, signal.SIGKILL)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                log.error("xemu did not exit after SIGKILL — giving up")
+    except ProcessLookupError:
+        pass  # already gone
+
+
+def _launch_xemu() -> bool:
+    """Spawn xemu as abc with the QMP socket flag. Returns False on failure."""
+    _kill_xemu()
+    if not _wait_for_no_xemu():
+        # _kill_xemu reaped the managed group, so any survivor is a stray.
+        _reap_stray_xemu()
+
+    # QEMU fails to bind if a dead socket file is left behind.
+    try:
+        QMP_SOCKET.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("Could not remove stale QMP socket %s: %s", QMP_SOCKET, exc)
+
+    cmd = [
+        "sudo", "-u", "abc", "env",
+        *[f"{k}={v}" for k, v in ENV.items()],
+        XEMU_CMD,
+        "-qmp", f"unix:{QMP_SOCKET},server,nowait",
+    ]
+    log.info("Launching xemu...")
+    log.debug("Launching: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setpgrp,  # own process group so killpg is clean
+        )
+    except OSError as exc:
+        log.error("Failed to launch xemu: %s", exc)
+        return False
+
+    with _lock:
+        _state["process"] = proc
+    log.info("xemu launched (PID %d)", proc.pid)
+    return True
 
 
 # ── QMP ───────────────────────────────────────────────────────────────────────
@@ -179,19 +308,6 @@ def _qmp_load_rom(rom_path: str) -> bool:
         log.info("QMP: loaded ROM %s and reset confirmed", rom_path)
         return True
     log.error("QMP: reset not confirmed after loading ROM %s", rom_path)
-    return False
-
-
-def _qmp_return_to_dashboard() -> bool:
-    """Eject the disc and reset — xemu boots back to the Xbox dashboard."""
-    try:
-        _qmp_command("eject", {"device": "ide0-cd1"})
-    except (OSError, ValueError) as exc:
-        log.warning("QMP: eject failed before reset: %s — disc may still be inserted", exc)
-    if _qmp_reset_confirmed():
-        log.info("QMP: disc ejected and console reset to dashboard")
-        return True
-    log.error("QMP: reset not confirmed returning to dashboard")
     return False
 
 
@@ -325,27 +441,40 @@ def _qmp_load_state(slot: int) -> bool:
 
 
 def _do_load_rom(rom_path: str) -> None:
-    """Wait for QMP, inject ROM, update state. Runs in a background thread."""
-    with _lock:
-        _state["launch_error"] = None
-    log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
-    if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
-        log.error("QMP not available after %.0fs — ROM load aborted", QMP_BOOT_TIMEOUT)
+    """Ensure xemu is running, inject ROM, update state. Runs in a background thread."""
+    try:
         with _lock:
-            _state["launch_error"] = (
-                f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — ROM load aborted"
-            )
-        return
+            _state["launch_error"] = None
 
-    ok = _qmp_load_rom(rom_path)
-    with _lock:
-        if ok:
-            _state["rom_path"] = rom_path
-            _state["rom_name"] = Path(rom_path).stem
-            _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        else:
-            _state["launch_error"] = "Failed to load ROM into xemu — see container logs"
-            log.error("ROM load failed for %s", rom_path)
+        # Reuse a live instance (disc inject + reset is much faster than a
+        # cold boot); spawn one otherwise.
+        if not _qmp_available():
+            if not _launch_xemu():
+                with _lock:
+                    _state["launch_error"] = "Failed to spawn xemu — see container logs"
+                return
+
+        log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
+        if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
+            log.error("QMP not available after %.0fs — ROM load aborted", QMP_BOOT_TIMEOUT)
+            with _lock:
+                _state["launch_error"] = (
+                    f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — ROM load aborted"
+                )
+            return
+
+        ok = _qmp_load_rom(rom_path)
+        with _lock:
+            if ok:
+                _state["rom_path"] = rom_path
+                _state["rom_name"] = Path(rom_path).stem
+                _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            else:
+                _state["launch_error"] = "Failed to load ROM into xemu — see container logs"
+                log.error("ROM load failed for %s", rom_path)
+    finally:
+        with _lock:
+            _state["launch_in_progress"] = False
 
 
 # ── PulseAudio ────────────────────────────────────────────────────────────────
@@ -467,6 +596,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not rom_path.exists():
                 self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
                 return
+            # Check save_in_progress and claim launch_in_progress in one lock
+            # acquisition so a save can't start in the gap and be killed
+            # mid-snapshot by the launch.
+            with _lock:
+                if _state["save_in_progress"]:
+                    self._send_json(409, {"error": "save in progress"})
+                    return
+                if _state["launch_in_progress"]:
+                    self._send_json(409, {"error": "launch already in progress"})
+                    return
+                _state["launch_in_progress"] = True
             Thread(target=_do_load_rom, args=(str(rom_path),), daemon=True).start()
             self._send_json(200, {"status": "loading", "rom_path": str(rom_path)})
             return
@@ -555,8 +695,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 try:
                     ok = _qmp_save_state(s)
                     if not ok:
-                        log.warning("save-and-exit: save failed (slot %d) — returning to dashboard anyway", s)
-                    _qmp_return_to_dashboard()
+                        log.warning("save-and-exit: save failed (slot %d) — exiting anyway", s)
+                    # Kill rather than return to the dashboard: an idle xemu
+                    # busy-loops several CPU cores under software rendering.
+                    _kill_xemu()
                 except Exception as exc:
                     log.error("save-and-exit: unexpected error: %s", exc)
                 finally:
@@ -609,12 +751,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden"})
             return
         if self.path == "/launch":
-            _qmp_return_to_dashboard()
+            # Kill rather than eject to the dashboard: an idle xemu busy-loops
+            # several CPU cores under software rendering.
+            _kill_xemu()
             with _lock:
                 _state["rom_path"] = None
                 _state["rom_name"] = None
                 _state["started_at"] = None
-            log.info("Disc ejected and returned to dashboard via DELETE /launch")
+            log.info("Session ended via DELETE /launch — xemu stopped")
             self._send_json(200, {"status": "ok"})
             return
         self._send_json(404, {"error": "not found"})
@@ -624,10 +768,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 
 def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
-    """Stop the HTTP listener and let any in-flight snapshot job finish.
+    """Stop the HTTP listener, let any in-flight snapshot finish, kill xemu.
     Triggered on SIGTERM/SIGINT — serve_forever()'s KeyboardInterrupt path
-    does not cover SIGTERM from s6/systemd. xemu itself is not managed by
-    the broker, so there is no process to kill here."""
+    does not cover SIGTERM from s6/systemd. Killing xemu here prevents the
+    broker restart from leaving an orphan burning CPU with no QMP owner."""
     log.info("Received signal %d — beginning graceful shutdown", signum)
     Thread(target=server.shutdown, daemon=True).start()
 
@@ -639,6 +783,8 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
         time.sleep(0.2)
     else:
         log.warning("Shutdown: in-flight snapshot did not conclude within %.1fs", QMP_WAIT)
+
+    _kill_xemu()
     log.info("Shutdown complete")
 
 
@@ -646,6 +792,9 @@ def main():
     log.info("Broker starting on port %d", PORT)
     if not SECRET:
         log.warning("BROKER_SECRET not set — all POST/DELETE endpoints are unauthenticated")
+
+    # A previous broker run may have left an unmanaged xemu behind.
+    _reap_stray_xemu()
 
     # ThreadingHTTPServer: snapshot loads run inline in the handler (up to
     # QMP_WAIT); a single-threaded server would stall /health and /status.

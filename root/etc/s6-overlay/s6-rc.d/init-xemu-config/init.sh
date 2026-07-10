@@ -20,23 +20,22 @@ if [ "$_need_apt" = "1" ]; then
         || echo "[xemu-broker-mod] ERROR: apt-get install failed"
 fi
 
-# ── Patch labwc autostart to expose QMP ──────────────────────────────────────
+# ── Disable boot-time xemu in the desktop autostart ──────────────────────────
 # The base image autostart runs: xterm -e /opt/xemu/AppRun
-# We add the -qmp flag so the broker can inject ROMs and manage save states.
-# We only write if the file doesn't already contain the qmp flag, so manual
-# edits to the autostart are preserved across restarts.
-AUTOSTART="/config/.config/labwc/autostart"
-mkdir -p "$(dirname "$AUTOSTART")"
-
-QMP_SOCKET="/tmp/xemu-qmp.sock"
-QMP_FLAG="-qmp unix:${QMP_SOCKET},server,nowait"
-
-if [ ! -f "$AUTOSTART" ] || ! grep -q "xemu-qmp" "$AUTOSTART"; then
-    printf '#!/bin/bash\n\n# Run xemu with QMP socket for broker ROM injection\nxterm -e /opt/xemu/AppRun %s\n' "$QMP_FLAG" > "$AUTOSTART"
-    echo "[xemu-broker-mod] Wrote labwc autostart with QMP flag."
-else
-    echo "[xemu-broker-mod] labwc autostart already has QMP flag — skipping."
-fi
+# The broker owns the xemu lifecycle (spawns it on /launch with the -qmp flag,
+# kills it when the session ends), so a boot-time instance would fight the
+# broker for the QMP socket and busy-loop CPU cores idling at the dashboard.
+# Written for both the labwc and openbox image variants; the broker-managed
+# marker keeps manual edits from being clobbered on restart.
+for AUTOSTART in /config/.config/labwc/autostart /config/.config/openbox/autostart; do
+    mkdir -p "$(dirname "$AUTOSTART")"
+    if [ ! -f "$AUTOSTART" ] || ! grep -q "broker-managed" "$AUTOSTART"; then
+        printf '#!/bin/bash\n\n# xemu is broker-managed: the RomM broker launches it on demand with a\n# QMP socket and kills it when the session ends. Do not launch it here.\n' > "$AUTOSTART"
+        echo "[xemu-broker-mod] Wrote broker-managed autostart at $AUTOSTART."
+    else
+        echo "[xemu-broker-mod] $AUTOSTART already broker-managed — skipping."
+    fi
+done
 
 # ── Seed xemu.toml defaults ──────────────────────────────────────────────────
 # xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.
