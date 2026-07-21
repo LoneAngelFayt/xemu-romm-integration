@@ -98,6 +98,49 @@ if amd_gpu:
 p.write_text(text)
 PYEOF
 
+# ── Per-container Xbox hard disk image ───────────────────────────────────────
+# xemu writes save-state snapshots INTO the hard disk qcow2. The stock image
+# normally sits on a shared bios mount, so every container would write its
+# snapshots into the same file and players would see each other's states. Copy
+# it into /config once and point xemu at the copy.
+HDD_LOCAL="/config/xemu/xbox_hdd.qcow2"
+
+python3 - "$XEMU_CONFIG" "$HDD_LOCAL" <<'PYEOF'
+import re, shutil, sys
+from pathlib import Path
+
+config, local = Path(sys.argv[1]), Path(sys.argv[2])
+text = config.read_text() if config.exists() else ''
+
+m = re.search(r"^\s*hdd_path\s*=\s*'([^']*)'", text, re.MULTILINE)
+current = m.group(1) if m else ''
+
+if current == str(local) and local.exists():
+    print('[xemu-broker-mod] Hard disk image already container-local.')
+    sys.exit(0)
+
+if not local.exists():
+    if not current or not Path(current).is_file():
+        print('[xemu-broker-mod] No stock hard disk image configured, skipping relocation.')
+        sys.exit(0)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(current, local)
+    print(f'[xemu-broker-mod] Copied hard disk image {current} -> {local}.')
+
+if m:
+    text = f'{text[:m.start(1)]}{local}{text[m.end(1):]}'
+elif re.search(r'^\[sys\.files\]', text, re.MULTILINE):
+    text = re.sub(r'(^\[sys\.files\][^\n]*\n)', f"\\g<1>hdd_path = '{local}'\n",
+                  text, count=1, flags=re.MULTILINE)
+else:
+    text += f"\n[sys.files]\nhdd_path = '{local}'\n"
+
+config.write_text(text)
+print(f'[xemu-broker-mod] Pointed hdd_path at {local}.')
+PYEOF
+
+chown -R abc:abc /config/xemu 2>/dev/null || true
+
 # ── Fix ownership so xemu (running as abc) can write its config ───────────────
 chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null || true
 echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."

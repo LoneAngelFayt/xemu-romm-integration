@@ -7,17 +7,22 @@ xemu is QEMU-based and busy-loops several CPU cores while idling at the
 dashboard, so no gameless instance is ever kept around."""
 
 import hmac
+import io
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import socket as _socket
 import subprocess
 import sys
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
+from urllib.parse import parse_qs, urlparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -28,6 +33,17 @@ QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 QMP_BOOT_TIMEOUT = float(os.environ.get("QMP_BOOT_TIMEOUT", "60.0"))
+
+# The hard disk image doubles as the save-state artifact: xemu writes snapshots
+# into it, and there is no way to export one snapshot on its own.
+HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
+HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
+STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
+STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
+
+# xemu runs as abc and must be able to write snapshots into a restored image.
+_ABC_UID = int(os.environ.get("PUID", "1000"))
+_ABC_GID = int(os.environ.get("PGID", "1000"))
 
 # /opt/xemu/AppRun is a symlink to the xemu binary, so the spawned process
 # reports comm "AppRun" (see _reap_stray_xemu).
@@ -88,6 +104,16 @@ def _validate_rom_path(raw: str) -> Path | None:
 
 
 # ── Process lifecycle ─────────────────────────────────────────────────────────
+
+
+def _wait_for_save_idle(deadline: float) -> bool:
+    """Block until no snapshot job is in flight. False on timeout."""
+    while time.monotonic() < deadline:
+        with _lock:
+            if not _state["save_in_progress"]:
+                return True
+        time.sleep(0.2)
+    return False
 
 
 def _wait_for_no_xemu(timeout: float = 3.0) -> bool:
@@ -322,6 +348,90 @@ def _qmp_get_hdd_node() -> str:
     raise ValueError("ide0-hd0 block node not found")
 
 
+def _qmp_snapshot_tags() -> set:
+    """Every internal snapshot tag on the Xbox hard disk image.
+
+    An empty set on failure would read as "this slot holds no state", so the
+    caller must not treat it as authoritative when xemu is down."""
+    try:
+        r = _qmp_command("query-block")
+    except (OSError, ValueError) as exc:
+        log.error("QMP: query-block failed: %s", exc)
+        return set()
+    for dev in r.get("return", []):
+        if dev.get("device") != "ide0-hd0":
+            continue
+        image = dev.get("inserted", {}).get("image", {})
+        return {s.get("name", "") for s in image.get("snapshots", [])}
+    log.error("QMP: query-block returned no ide0-hd0 device")
+    return set()
+
+
+def _qmp_pause() -> bool:
+    """Pause the guest so the qcow2 stops changing under a read."""
+    try:
+        _qmp_command("stop")
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: stop failed: %s", exc)
+        return False
+
+
+def _qmp_resume() -> bool:
+    try:
+        _qmp_command("cont")
+        return True
+    except (OSError, ValueError) as exc:
+        log.error("QMP: cont failed: %s", exc)
+        return False
+
+
+def _zip_hdd_image() -> bytes | None:
+    """Zip the hard disk image into memory.
+
+    The caller must have paused the guest first: this is a qcow2 a live QEMU
+    holds open, and a copy taken mid-write can catch torn metadata."""
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(HDD_IMAGE, HDD_IMAGE_ENTRY)
+    except OSError as exc:
+        log.error("state-file: could not zip %s: %s", HDD_IMAGE, exc)
+        return None
+    return buf.getvalue()
+
+
+def _restore_hdd_image(content: bytes) -> str | None:
+    """Replace the hard disk image with the one inside a pulled state archive.
+
+    Returns an error string, or None on success. Writes to a temp file and
+    renames, so a truncated transfer cannot leave a corrupt disk behind."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return "body is not a zip archive"
+    with zf:
+        members = [i for i in zf.infolist() if not i.is_dir()]
+        if len(members) != 1 or members[0].filename != HDD_IMAGE_ENTRY:
+            return f"archive must hold exactly one {HDD_IMAGE_ENTRY} member"
+        if members[0].file_size > STATE_FILE_MAX_BYTES:
+            return "archive exceeds size limit when extracted"
+        tmp = HDD_IMAGE.parent / f".{HDD_IMAGE.name}.tmp"
+        try:
+            HDD_IMAGE.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(members[0]) as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.chown(tmp, _ABC_UID, _ABC_GID)
+            os.replace(tmp, HDD_IMAGE)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return f"could not write the hard disk image: {exc}"
+    return None
+
+
 def _qmp_snapshot(cmd: str, tag: str) -> bool:
     """Run snapshot-save or snapshot-load as an async job; wait for completion."""
     try:
@@ -440,8 +550,9 @@ def _qmp_load_state(slot: int) -> bool:
 # ── ROM loading (background) ──────────────────────────────────────────────────
 
 
-def _do_load_rom(rom_path: str) -> None:
-    """Ensure xemu is running, inject ROM, update state. Runs in a background thread."""
+def _do_load_rom(rom_path: str, load_slot: int | None = None) -> None:
+    """Ensure xemu is running, inject ROM, update state, optionally resume from
+    a slot. Runs in a background thread."""
     try:
         with _lock:
             _state["launch_error"] = None
@@ -464,6 +575,10 @@ def _do_load_rom(rom_path: str) -> None:
             return
 
         ok = _qmp_load_rom(rom_path)
+        # Load after the ROM is in the drive: the snapshot restores a machine
+        # that was already running this disc.
+        if ok and load_slot is not None and not _qmp_load_state(load_slot):
+            log.error("Resume failed: no usable state in slot %d", load_slot)
         with _lock:
             if ok:
                 _state["rom_path"] = rom_path
@@ -511,6 +626,16 @@ def _pactl_get_mute() -> bool | None:
     return result.stdout.strip().endswith("yes")
 
 
+def _cleanup_sockets():
+    """Restart selkies to flush all stale gamepad connections."""
+    log.info("Socket cleanup: restarting selkies...")
+    result = subprocess.run(["pkill", "-15", "-f", "selkies"], capture_output=True)
+    if result.returncode == 0:
+        log.info("Socket cleanup: selkies stopped, s6 will restart it shortly.")
+    else:
+        log.warning("Socket cleanup: selkies not found or already stopped.")
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 
@@ -545,6 +670,62 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _get_state_file(self):
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            slot = int(query.get("slot", ["0"])[0])
+        except ValueError:
+            self._send_json(400, {"error": "slot must be an integer"})
+            return
+        if not (1 <= slot <= 10):
+            self._send_json(400, {"error": "slot must be 1-10"})
+            return
+
+        # RomM fetches straight after POST /save-state, whose snapshot job runs
+        # in the background. Serving mid-job would ship an image without the
+        # capture in it.
+        if not _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT):
+            self._send_json(409, {"error": "save still in progress"})
+            return
+
+        if not _qmp_available():
+            self._send_json(409, {"error": "xemu is not running"})
+            return
+        if f"broker-slot-{slot}" not in _qmp_snapshot_tags():
+            self._send_json(404, {"error": "no state for slot", "slot": slot})
+            return
+
+        with _lock:
+            rom_name = _state["rom_name"]
+
+        if not _qmp_pause():
+            self._send_json(503, {"error": "could not pause xemu to read the disk image"})
+            return
+        try:
+            content = _zip_hdd_image()
+        finally:
+            _qmp_resume()
+
+        if content is None:
+            self._send_json(500, {"error": "could not read the hard disk image"})
+            return
+        if len(content) > STATE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "state file exceeds size limit"})
+            return
+
+        # Header values must be latin-1; ROM stems can be anything.
+        safe_name = "".join(
+            c for c in (rom_name or "xemu") if c.isascii() and c.isprintable()
+        ).strip() or "xemu"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-State-Filename", f"{safe_name}.x{slot:02d}")
+        self.end_headers()
+        self.wfile.write(content)
+        log.info("state-file: served slot %d as %s.x%02d (%d bytes)",
+                 slot, safe_name, slot, len(content))
+
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
@@ -573,11 +754,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if urlparse(self.path).path == "/state-file":
+            self._get_state_file()
+            return
+
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
+            return
+
+        if self.path == "/cleanup":
+            Thread(target=_cleanup_sockets, daemon=True).start()
+            self._send_json(200, {"status": "cleanup started"})
             return
 
         if self.path == "/launch":
@@ -596,6 +786,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not rom_path.exists():
                 self._send_json(422, {"error": "rom_path does not exist", "path": str(rom_path)})
                 return
+            load_slot = body.get("load_slot")
+            if load_slot is not None and (
+                not isinstance(load_slot, int) or not (1 <= load_slot <= 10)
+            ):
+                self._send_json(400, {"error": "load_slot must be 1-10"})
+                return
             # Check save_in_progress and claim launch_in_progress in one lock
             # acquisition so a save can't start in the gap and be killed
             # mid-snapshot by the launch.
@@ -607,8 +803,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "launch already in progress"})
                     return
                 _state["launch_in_progress"] = True
-            Thread(target=_do_load_rom, args=(str(rom_path),), daemon=True).start()
-            self._send_json(200, {"status": "loading", "rom_path": str(rom_path)})
+            Thread(
+                target=_do_load_rom, args=(str(rom_path), load_slot), daemon=True
+            ).start()
+            self._send_json(200, {
+                "status": "loading",
+                "rom_path": str(rom_path),
+                "load_slot": load_slot,
+            })
             return
 
         if self.path == "/save-state":
@@ -745,6 +947,52 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+        parsed = urlparse(self.path)
+        if parsed.path != "/state-file":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        # Basename only. The name came from a previous GET and is written back
+        # verbatim, so path parts are rejected rather than normalised.
+        filename = Path(parse_qs(parsed.query).get("filename", [""])[0]).name
+        if filename.startswith(".") or not re.fullmatch(r".+\.x\d{2}", filename):
+            self._send_json(400, {"error": "filename must be a <name>.xNN basename"})
+            return
+
+        # Restoring under a live QEMU would corrupt the image it has open. RomM
+        # pushes before launch, so this never blocks the legitimate path.
+        if _qmp_available():
+            self._send_json(409, {
+                "error": "xemu is running; stop the session before restoring a state",
+            })
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or invalid Content-Length"})
+            return
+        if length > STATE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "state file exceeds size limit"})
+            return
+        content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
+
+        error = _restore_hdd_image(content)
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        log.info("state-file: restored %s (%d bytes)", filename, length)
+        self._send_json(200, {"status": "ok", "filename": filename})
 
     def do_DELETE(self):
         if not self._check_secret():
