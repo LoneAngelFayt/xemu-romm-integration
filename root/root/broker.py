@@ -21,7 +21,7 @@ import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread, Lock
+from threading import Thread, Lock, Timer
 from urllib.parse import parse_qs, urlparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -33,6 +33,10 @@ QMP_SOCKET = Path(os.environ.get("QMP_SOCKET", "/tmp/xemu-qmp.sock"))
 QMP_TIMEOUT = float(os.environ.get("QMP_TIMEOUT", "2.0"))
 QMP_WAIT = float(os.environ.get("QMP_WAIT", "10.0"))
 QMP_BOOT_TIMEOUT = float(os.environ.get("QMP_BOOT_TIMEOUT", "60.0"))
+
+# A setup session (gameless xemu for configuring the machine) auto-stops after
+# this many seconds so it never idles indefinitely burning CPU.
+SETUP_TIMEOUT = float(os.environ.get("SETUP_TIMEOUT", "900"))
 
 # The hard disk image doubles as the save-state artifact: xemu writes snapshots
 # into it, and there is no way to export one snapshot on its own.
@@ -88,6 +92,8 @@ _state: dict = {
     "save_in_progress": False,
     "launch_in_progress": False,  # guards against concurrent /launch requests
     "launch_error": None,
+    "setup": False,               # gameless xemu is up for configuration
+    "setup_timer": None,          # threading.Timer that auto-stops setup
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -592,6 +598,81 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None) -> None:
             _state["launch_in_progress"] = False
 
 
+# ── Setup session ─────────────────────────────────────────────────────────────
+
+
+def _cancel_setup_watchdog() -> None:
+    """Cancel and drop the setup auto-expiry timer. Caller need not hold _lock."""
+    with _lock:
+        timer = _state["setup_timer"]
+        _state["setup_timer"] = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _arm_setup_watchdog() -> None:
+    """Start the timer that stops an idle setup session after SETUP_TIMEOUT."""
+    _cancel_setup_watchdog()
+    timer = Timer(SETUP_TIMEOUT, _setup_expired)
+    timer.daemon = True
+    with _lock:
+        _state["setup_timer"] = timer
+    timer.start()
+
+
+def _setup_expired() -> None:
+    """Watchdog callback: stop xemu if a setup session is still the live state.
+    A ROM launch or explicit stop supersedes setup, so re-check under the lock;
+    a cancel/fire race is then harmless."""
+    with _lock:
+        if not _state["setup"] or _state["rom_path"] is not None:
+            return
+        _state["setup"] = False
+        _state["setup_timer"] = None
+    log.info("Setup session timed out after %.0fs — stopping xemu", SETUP_TIMEOUT)
+    _kill_xemu()
+
+
+def _end_setup() -> None:
+    """Clear setup mode and cancel its watchdog. Does not stop xemu; the caller
+    decides whether xemu keeps running (ROM takeover) or is killed (explicit stop)."""
+    _cancel_setup_watchdog()
+    with _lock:
+        _state["setup"] = False
+
+
+def _do_setup() -> None:
+    """Boot xemu with no disc so the user can configure it, then arm the
+    auto-expiry watchdog. Runs in a background thread."""
+    try:
+        if not _qmp_available():
+            if not _launch_xemu():
+                with _lock:
+                    _state["setup"] = False
+                    _state["launch_error"] = "Failed to spawn xemu — see container logs"
+                return
+
+        log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
+        if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
+            log.error("QMP not available after %.0fs — setup aborted", QMP_BOOT_TIMEOUT)
+            with _lock:
+                _state["setup"] = False
+                _state["launch_error"] = (
+                    f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — setup aborted"
+                )
+            _kill_xemu()
+            return
+
+        # No disc inserted: xemu sits at the dashboard / config UI.
+        with _lock:
+            _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _arm_setup_watchdog()
+        log.info("Setup session ready — xemu at the dashboard (auto-stops in %.0fs)", SETUP_TIMEOUT)
+    finally:
+        with _lock:
+            _state["launch_in_progress"] = False
+
+
 # ── PulseAudio ────────────────────────────────────────────────────────────────
 
 _PACTL_CMD = [
@@ -744,9 +825,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 rom_name = _state["rom_name"]
                 started_at = _state["started_at"]
                 launch_error = _state["launch_error"]
+                setup = _state["setup"]
             self._send_json(200, {
                 "xemu_running": xemu_up,
                 "active": xemu_up and rom_path is not None,
+                "setup": xemu_up and setup and rom_path is None,
                 "rom_path": rom_path,
                 "rom_name": rom_name,
                 "started_at": started_at,
@@ -803,6 +886,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "launch already in progress"})
                     return
                 _state["launch_in_progress"] = True
+            # A real launch supersedes any setup session: cancel its watchdog and
+            # clear the flag, then reuse the live xemu to insert the disc.
+            _end_setup()
             Thread(
                 target=_do_load_rom, args=(str(rom_path), load_slot), daemon=True
             ).start()
@@ -811,6 +897,24 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "rom_path": str(rom_path),
                 "load_slot": load_slot,
             })
+            return
+
+        if self.path == "/setup":
+            with _lock:
+                if _state["rom_path"] is not None:
+                    self._send_json(409, {"error": "a game session is active"})
+                    return
+                if _state["launch_in_progress"]:
+                    self._send_json(409, {"error": "launch already in progress"})
+                    return
+                if _state["setup"]:
+                    self._send_json(200, {"status": "setup", "already": True})
+                    return
+                _state["setup"] = True
+                _state["launch_in_progress"] = True
+                _state["launch_error"] = None
+            Thread(target=_do_setup, daemon=True).start()
+            self._send_json(200, {"status": "starting setup", "timeout": SETUP_TIMEOUT})
             return
 
         if self.path == "/save-state":
@@ -999,8 +1103,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "forbidden"})
             return
         if self.path == "/launch":
-            # Kill rather than eject to the dashboard: an idle xemu busy-loops
-            # several CPU cores under software rendering.
+            # Ends a game session or a setup session. Kill rather than eject to
+            # the dashboard: an idle xemu busy-loops several CPU cores under
+            # software rendering.
+            _end_setup()
             _kill_xemu()
             with _lock:
                 _state["rom_path"] = None
