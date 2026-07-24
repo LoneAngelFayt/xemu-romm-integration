@@ -21,7 +21,7 @@ Save states are stored as named snapshots inside the HDD image. The HDD image mu
 - Save state support — 9 user slots + 1 autosave slot (slot 10), stored inside the Xbox HDD image
 - Volume and mute control via PulseAudio
 - Controller support via the selkies joystick interposer (gamepad auto-configured on port 1)
-- AMD GPU support — automatically corrects invalid `Vulkan` renderer setting in `xemu.toml`
+- AMD GPU support — pins the Vulkan renderer in `xemu.toml`, since xemu's OpenGL path hangs the GPU here
 - Save states importable into the RomM library, and resumable on any container
 - Per-container Xbox hard disk image, so players never share save data
 
@@ -74,6 +74,7 @@ services:
 | `QMP_BOOT_TIMEOUT` | `60.0` | Max seconds to wait for xemu to become QMP-ready after `/launch` |
 | `BROKER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `HDD_IMAGE` | `/config/xemu/xbox_hdd.qcow2` | Xbox hard disk image the broker reads and restores as a save state |
+| `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
 | `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state archive in either direction |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
 
@@ -173,7 +174,7 @@ The broker owns the xemu process. The desktop autostart is neutered at startup s
 Startup (init.sh)
   └── Write broker-managed autostart (labwc + openbox): no boot-time xemu
   └── Seed xemu.toml: port1_driver = 'usb-xbox-gamepad'
-  └── Fix invalid renderer = 'Vulkan' → 'opengl' (AMD GPUs)
+  └── Pin renderer = 'VULKAN' (AMD GPUs): xemu's OpenGL path hangs the GPU
   └── Copy the stock Xbox HDD image to /config/xemu and repoint hdd_path
   └── chown xemu config dir to abc
 

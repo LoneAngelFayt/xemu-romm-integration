@@ -43,8 +43,12 @@ done
 #   [input.bindings]   port1_driver = 'usb-xbox-gamepad'  — always, so a
 #                      fresh container presents port 1 as an SDL gamepad
 #                      without requiring manual UI setup.
-#   [display]          renderer = 'opengl'                 — only on AMD GPUs,
-#                      correcting the invalid 'Vulkan' value if present.
+#   [display]          renderer = 'VULKAN'                 — only on AMD GPUs.
+#                      xemu's OpenGL path asserts in gl_fence after an amdgpu
+#                      ring-timeout reset on Renoir/Mesa, so pin Vulkan, which
+#                      is the renderer the other emulators run stably here.
+#                      xemu's toml enum tokens are upper-case: 'OPENGL',
+#                      'VULKAN', 'NULL' (a mixed-case 'Vulkan' is rejected).
 # Keys are only written if not already present so user edits are preserved.
 XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
 
@@ -52,7 +56,7 @@ _amd_gpu=0
 grep -q '^amdgpu ' /proc/modules 2>/dev/null && _amd_gpu=1
 
 if [ "$_amd_gpu" = "1" ]; then
-    echo "[xemu-broker-mod] AMD GPU detected — will seed opengl renderer."
+    echo "[xemu-broker-mod] AMD GPU detected — will pin Vulkan renderer."
 else
     echo "[xemu-broker-mod] No AMD GPU detected — skipping renderer seed."
 fi
@@ -83,17 +87,20 @@ if did:
     print("[xemu-broker-mod] Seeded [input.bindings] port1_driver = 'usb-xbox-gamepad'.")
 
 if amd_gpu:
-    # Correct invalid 'Vulkan' (rejected by xemu) to 'opengl'.
-    # Also seeds on first run if the key is absent entirely.
-    if re.search(r"^\s*renderer\s*=\s*'Vulkan'\s*$", text, re.MULTILINE):
-        text = re.sub(r"(^\s*renderer\s*=\s*)'Vulkan'", r"\g<1>'opengl'", text, flags=re.MULTILINE)
-        print("[xemu-broker-mod] Corrected [display] renderer from 'Vulkan' to 'opengl'.")
-    else:
-        text, did = _seed(text, '[display]', 'renderer', "'opengl'")
-        if did:
-            print("[xemu-broker-mod] Seeded [display] renderer = 'opengl'.")
+    # Pin Vulkan: the OpenGL path hangs the amdgpu GPU on this stack. Force any
+    # non-Vulkan value to 'VULKAN', else seed it on first run. Enum tokens are
+    # upper-case ('OPENGL'/'VULKAN'/'NULL'); xemu writes 'OPENGL' when a user
+    # picks it in the UI, so match the existing value regardless of case.
+    m_r = re.search(r"^(\s*renderer\s*=\s*)'([^']*)'", text, re.MULTILINE)
+    if m_r:
+        if m_r.group(2) != 'VULKAN':
+            text = f"{text[:m_r.start()]}{m_r.group(1)}'VULKAN'{text[m_r.end():]}"
+            print(f"[xemu-broker-mod] Set [display] renderer to 'VULKAN' (was '{m_r.group(2)}').")
         else:
-            print("[xemu-broker-mod] [display] renderer already set — skipping.")
+            print("[xemu-broker-mod] [display] renderer already 'VULKAN'.")
+    else:
+        text, _ = _seed(text, '[display]', 'renderer', "'VULKAN'")
+        print("[xemu-broker-mod] Seeded [display] renderer = 'VULKAN'.")
 
 p.write_text(text)
 PYEOF
@@ -104,28 +111,61 @@ PYEOF
 # snapshots into the same file and players would see each other's states. Copy
 # it into /config once and point xemu at the copy.
 HDD_LOCAL="/config/xemu/xbox_hdd.qcow2"
+HDD_STOCK="${HDD_STOCK:-/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2}"
 
-python3 - "$XEMU_CONFIG" "$HDD_LOCAL" <<'PYEOF'
-import re, shutil, sys
+python3 - "$XEMU_CONFIG" "$HDD_LOCAL" "$HDD_STOCK" <<'PYEOF'
+import os, re, shutil, sys
 from pathlib import Path
 
-config, local = Path(sys.argv[1]), Path(sys.argv[2])
+config, local, stock = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 text = config.read_text() if config.exists() else ''
 
 m = re.search(r"^\s*hdd_path\s*=\s*'([^']*)'", text, re.MULTILINE)
 current = m.group(1) if m else ''
 
-if current == str(local) and local.exists():
-    print('[xemu-broker-mod] Hard disk image already container-local.')
-    sys.exit(0)
 
-if not local.exists():
-    if not current or not Path(current).is_file():
-        print('[xemu-broker-mod] No stock hard disk image configured, skipping relocation.')
+def usable(p):
+    """A qcow2 xemu can actually open. A truncated copy is worse than none:
+    xemu falls back to its first-run wizard and the container looks unset up."""
+    try:
+        if p.stat().st_size == 0:
+            return False
+        with p.open('rb') as fh:
+            return fh.read(4) == b'QFI\xfb'
+    except OSError:
+        return False
+
+
+# hdd_path is rewritten to the local copy on first run, so it stops being a
+# usable source. Keep the stock image as the fallback origin.
+source = Path(current) if current and Path(current) != local else stock
+
+if usable(local):
+    print('[xemu-broker-mod] Hard disk image already container-local.')
+else:
+    if local.exists():
+        print(f'[xemu-broker-mod] {local} is not a usable qcow2, recopying.')
+    if not usable(source):
+        print(f'[xemu-broker-mod] ERROR: no usable stock hard disk image at {source}, '
+              'leaving hdd_path alone.')
         sys.exit(0)
     local.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(current, local)
-    print(f'[xemu-broker-mod] Copied hard disk image {current} -> {local}.')
+    # Copy via a temp name so an interrupted copy never lands on the real
+    # path, where the next run would accept it as done.
+    part = local.with_name(local.name + '.part')
+    try:
+        shutil.copy2(source, part)
+        if part.stat().st_size != source.stat().st_size:
+            raise OSError(f'short copy: {part.stat().st_size} of {source.stat().st_size} bytes')
+        os.replace(part, local)
+    except OSError as exc:
+        part.unlink(missing_ok=True)
+        print(f'[xemu-broker-mod] ERROR: copying {source} -> {local} failed: {exc}')
+        sys.exit(0)
+    print(f'[xemu-broker-mod] Copied hard disk image {source} -> {local}.')
+
+if current == str(local):
+    sys.exit(0)
 
 if m:
     text = f'{text[:m.start(1)]}{local}{text[m.end(1):]}'
