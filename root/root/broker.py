@@ -266,8 +266,17 @@ def _kill_xemu() -> None:
         pass  # already gone
 
 
-def _launch_xemu() -> bool:
-    """Spawn xemu as abc with the QMP socket flag. Returns False on failure."""
+def _launch_xemu(rom_path: str | None = None) -> bool:
+    """Spawn xemu as abc with the QMP socket flag. Returns False on failure.
+
+    `rom_path` puts the disc in the drive at power-on, which is the only safe
+    way to start a game on a cold boot. Injecting it afterwards costs a
+    system_reset, and QMP answers about a second after the process starts —
+    while the guest is still down inside the MCPX bootrom. A reset landing
+    there wedges the machine: it stays "running" and burns a full core, but
+    never draws a frame or plays a sample. Only an instance that has finished
+    booting can be reset safely.
+    """
     _kill_xemu()
     if not _wait_for_no_xemu():
         # _kill_xemu reaped the managed group, so any survivor is a stray.
@@ -283,6 +292,7 @@ def _launch_xemu() -> bool:
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
         XEMU_CMD,
+        *(["-dvd_path", rom_path] if rom_path else []),
         "-qmp", f"unix:{QMP_SOCKET},server,nowait",
     ]
     log.info("Launching xemu...")
@@ -1322,10 +1332,10 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None,
             _state["resume_error"] = None
 
         # Reuse a live instance (disc inject + reset is much faster than a
-        # cold boot); spawn one otherwise.
+        # cold boot); spawn one otherwise, with the disc already in the drive.
         spawned = False
         if not _qmp_available():
-            if not _launch_xemu():
+            if not _launch_xemu(rom_path):
                 with _lock:
                     if not _session_superseded(generation):
                         _state["launch_error"] = "Failed to spawn xemu — see container logs"
@@ -1352,7 +1362,9 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None,
         if _abandon_if_cancelled(generation, spawned):
             return
 
-        ok = _qmp_load_rom(rom_path)
+        # A cold start booted the disc from power-on, so there is nothing left
+        # to insert and — crucially — nothing to reset.
+        ok = True if spawned else _qmp_load_rom(rom_path)
         # Load after the ROM is in the drive: the snapshot restores a machine
         # that was already running this disc.
         if ok and load_slot is not None:
@@ -1394,12 +1406,10 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None,
             # A disc went into an xemu the user had already stopped.
             log.info("Session stopped mid-launch — discarding the loaded ROM")
             _kill_xemu()
-        elif not ok and spawned:
-            # Same reasoning as the QMP-timeout branch above: this xemu has no
-            # disc and no session, and a gameless one busy-loops CPU cores with
-            # nothing left to reap it. A reused instance is someone else's game.
-            log.info("ROM load failed — stopping the xemu this launch spawned")
-            _kill_xemu()
+        # Nothing to reap when `ok` is False: only the reuse path can fail the
+        # disc swap now, and that instance is still running someone's game. A
+        # spawn that fails is already killed by the QMP-timeout branch above,
+        # and one that succeeds has its disc from power-on.
     finally:
         with _lock:
             _state["launch_in_progress"] = False

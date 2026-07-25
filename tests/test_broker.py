@@ -112,7 +112,7 @@ def test_end_setup_clears_flag_and_cancels_timer():
 
 def test_do_setup_happy_arms_watchdog(monkeypatch):
     monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
     with broker._lock:
         broker._state["setup"] = True
@@ -127,7 +127,7 @@ def test_do_setup_happy_arms_watchdog(monkeypatch):
 
 def test_do_setup_launch_failure_clears_setup(monkeypatch):
     monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: False)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: False)
     with broker._lock:
         broker._state["setup"] = True
         broker._state["launch_in_progress"] = True
@@ -141,7 +141,7 @@ def test_do_setup_launch_failure_clears_setup(monkeypatch):
 def test_do_setup_qmp_timeout_stops_and_clears(monkeypatch):
     calls = []
     monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
     with broker._lock:
@@ -160,7 +160,7 @@ def test_do_setup_qmp_timeout_spares_a_reused_instance(monkeypatch):
     calls = []
     monkeypatch.setattr(broker, "_qmp_available", lambda: True)
     monkeypatch.setattr(
-        broker, "_launch_xemu", lambda: pytest.fail("a live instance must be reused")
+        broker, "_launch_xemu", lambda rom=None: pytest.fail("a live instance must be reused")
     )
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
@@ -177,11 +177,36 @@ def test_do_setup_qmp_timeout_spares_a_reused_instance(monkeypatch):
 # ── ROM launch path ───────────────────────────────────────────────────────────
 
 
+def test_launch_xemu_puts_the_disc_in_the_drive_at_power_on(monkeypatch, tmp_path):
+    argv = []
+
+    class _Proc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+    monkeypatch.setattr(broker, "_wait_for_no_xemu", lambda: True)
+    monkeypatch.setattr(broker, "QMP_SOCKET", tmp_path / "qmp.sock")
+    monkeypatch.setattr(
+        broker.subprocess, "Popen", lambda cmd, **kw: argv.append(cmd) or _Proc()
+    )
+
+    assert broker._launch_xemu("/romm/library/x.iso")
+    assert argv[0][argv[0].index("-dvd_path") + 1] == "/romm/library/x.iso"
+
+    argv.clear()
+    assert broker._launch_xemu()
+    # /setup boots to the dashboard, so it must not be handed a disc.
+    assert "-dvd_path" not in argv[0]
+
+
 def test_do_load_rom_qmp_timeout_kills_the_xemu_it_spawned(monkeypatch):
     """A discless xemu left behind busy-loops CPU cores with nothing to reap it."""
     calls = []
     monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
     with broker._lock:
@@ -199,7 +224,7 @@ def test_do_load_rom_qmp_timeout_spares_a_reused_instance(monkeypatch):
     calls = []
     monkeypatch.setattr(broker, "_qmp_available", lambda: True)
     monkeypatch.setattr(
-        broker, "_launch_xemu", lambda: pytest.fail("a live instance must be reused")
+        broker, "_launch_xemu", lambda rom=None: pytest.fail("a live instance must be reused")
     )
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
@@ -213,23 +238,41 @@ def test_do_load_rom_qmp_timeout_spares_a_reused_instance(monkeypatch):
         assert broker._state["launch_in_progress"] is False
 
 
-def test_do_load_rom_kills_the_xemu_it_spawned_when_the_rom_never_loads(monkeypatch):
-    """A spawned xemu whose disc never went in has no session at all, and a
-    gameless one busy-loops CPU cores with nothing left to reap it."""
-    calls = []
+def test_do_load_rom_boots_a_cold_start_from_the_disc_without_resetting(monkeypatch):
+    """A cold start must take the disc at power-on. Injecting it afterwards
+    costs a system_reset, and QMP answers while the guest is still inside the
+    MCPX bootrom — a reset landing there wedges the machine, which then burns a
+    core forever showing a black screen and playing silence."""
+    seen = []
     monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: seen.append(rom) or True)
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
-    monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: False)
-    monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    monkeypatch.setattr(
+        broker, "_qmp_load_rom", lambda p: pytest.fail("a cold start must not be reset")
+    )
     with broker._lock:
         broker._state["launch_in_progress"] = True
     broker._do_load_rom("/romm/library/x.iso")
-    assert calls == ["kill"]
+    assert seen == ["/romm/library/x.iso"]
     with broker._lock:
-        assert broker._state["launch_error"]
-        assert broker._state["rom_path"] is None
+        assert broker._state["rom_path"] == "/romm/library/x.iso"
+        assert broker._state["launch_error"] is None
         assert broker._state["launch_in_progress"] is False
+
+
+def test_do_load_rom_resumes_a_slot_after_a_cold_start(monkeypatch):
+    """The disc arriving at power-on rather than by injection must not cost the
+    resume: the snapshot still restores a machine already running this disc."""
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(broker, "_qmp_load_state", lambda s: True)
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom("/romm/library/x.iso", load_slot=3)
+    with broker._lock:
+        assert broker._state["rom_path"] == "/romm/library/x.iso"
+        assert broker._state["resume_error"] is None
 
 
 def test_do_load_rom_failed_load_spares_a_reused_instance(monkeypatch):
@@ -331,7 +374,7 @@ def client(monkeypatch):
     monkeypatch.setattr(broker, "SETUP_TIMEOUT", 30.0)
     monkeypatch.setattr(broker, "_qmp_available", lambda: True)
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
-    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), broker.BrokerHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

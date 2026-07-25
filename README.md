@@ -183,9 +183,11 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 #### `/launch` (POST)
 
 Validates `rom_path` is within `ROM_ROOT`, then starts a background thread that:
-1. Polls QMP until xemu is ready (up to `QMP_BOOT_TIMEOUT` seconds)
-2. Inserts the disc via `blockdev-change-medium`
-3. Sends `system_reset` and waits for the `RESET` event confirmation (3 retries)
+1. Spawns xemu with the disc already in the drive (`-dvd_path`) if none is running, so the game boots from power-on
+2. Polls QMP until xemu is ready (up to `QMP_BOOT_TIMEOUT` seconds)
+3. Only when reusing an already-booted xemu: inserts the disc via `blockdev-change-medium`, then sends `system_reset` and waits for the `RESET` event confirmation (3 retries)
+
+A cold start must never be reset. QMP answers about a second after the process starts, while the guest is still inside the MCPX bootrom, and a reset landing there wedges the machine — it stays `running` and burns a full core, but never draws a frame or plays a sample.
 
 Returns `200 {"status": "loading"}` immediately. Poll `/status` to confirm `active: true`.
 
@@ -263,7 +265,8 @@ Startup (init.sh)
   └── chown xemu config dir to abc
 
 Broker (broker.py, port 8000)
-  └── POST /launch     → spawn xemu -qmp … → blockdev-change-medium + system_reset
+  └── POST /launch     → spawn xemu -dvd_path <rom> -qmp … (cold start boots the disc, no reset)
+  │                      or blockdev-change-medium + system_reset when reusing a booted xemu
   │                      (optional load_slot resumes a snapshot after the disc is in)
   └── POST /setup      → spawn xemu -qmp … at the dashboard (no disc), auto-stop after SETUP_TIMEOUT
   └── DELETE /launch   → kill xemu (ends a game or setup session)
