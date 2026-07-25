@@ -827,7 +827,9 @@ def _raw_req(base, method, path, data=None, secret=None):
 @pytest.fixture
 def state_client(client, hdd, monkeypatch):
     """The broker server with slot 3 holding a snapshot and pause/resume working."""
-    monkeypatch.setattr(broker, "_qmp_snapshot_tags", lambda: {"broker-slot-3"})
+    monkeypatch.setattr(
+        broker, "_qmp_snapshot_tags", lambda: (str(hdd), {"broker-slot-3"})
+    )
     monkeypatch.setattr(broker, "_qmp_pause", lambda: True)
     monkeypatch.setattr(broker, "_qmp_resume", lambda: True)
     monkeypatch.setattr(broker, "STATE_GET_WAIT", 0.3)
@@ -878,6 +880,39 @@ def test_get_state_file_503_when_snapshot_query_fails(state_client, monkeypatch)
     code, _, body = _raw_req(state_client, "GET", "/state-file?slot=3")
     assert code == 503
     assert "could not query" in json.loads(body)["error"]
+
+
+def test_get_state_file_500_when_xemu_has_another_image_open(state_client, monkeypatch):
+    """hdd_path in xemu.toml is user-set: if it does not point at HDD_IMAGE the
+    snapshot lives in one file and the broker would zip a different one."""
+    monkeypatch.setattr(
+        broker, "_qmp_snapshot_tags",
+        lambda: ("/config/xemu/somewhere_else.qcow2", {"broker-slot-3"}),
+    )
+    code, _, body = _raw_req(state_client, "GET", "/state-file?slot=3")
+    assert code == 500  # not a 200 with an archive that lacks the capture
+    error = json.loads(body)
+    assert "different hard disk image" in error["error"]
+    assert error["xemu_image"] == "/config/xemu/somewhere_else.qcow2"
+    assert error["broker_image"] == str(broker.HDD_IMAGE)
+    with broker._lock:
+        assert broker._state["state_file_in_progress"] is False
+
+
+def test_get_state_file_500_when_qemu_reports_no_filename(state_client, monkeypatch):
+    """An unnamed image cannot be shown to be the one being served."""
+    monkeypatch.setattr(broker, "_qmp_snapshot_tags", lambda: ("", {"broker-slot-3"}))
+    assert _raw_req(state_client, "GET", "/state-file?slot=3")[0] == 500
+
+
+def test_same_image_matches_through_a_symlink(tmp_path):
+    """hdd_path is commonly a link into /config; that is still the same file."""
+    real = tmp_path / "xbox_hdd.qcow2"
+    real.write_bytes(b"image")
+    link = tmp_path / "linked.qcow2"
+    link.symlink_to(real)
+    assert broker._same_image(str(link), real) is True
+    assert broker._same_image(str(tmp_path / "other.qcow2"), real) is False
 
 
 def test_get_state_file_409_when_xemu_down(state_client, monkeypatch):

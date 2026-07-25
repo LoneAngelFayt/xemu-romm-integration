@@ -426,11 +426,13 @@ def _qmp_get_hdd_node() -> str:
     raise ValueError("ide0-hd0 block node not found")
 
 
-def _qmp_snapshot_tags() -> set | None:
-    """Every internal snapshot tag on the Xbox hard disk image.
+def _qmp_snapshot_tags() -> tuple[str, set] | None:
+    """The hard disk image xemu has open, and every internal snapshot tag on it.
 
-    None means the query itself failed. An empty set would read as "this slot
-    holds no state", so failure is never reported that way."""
+    Returns (filename, tags). None means the query itself failed; an empty set
+    would read as "this slot holds no state", so failure is never reported that
+    way. The filename comes back too because the snapshots belong to whatever
+    image QEMU opened, which need not be the one the broker serves."""
     try:
         r = _qmp_command("query-block")
     except (OSError, ValueError) as exc:
@@ -440,9 +442,25 @@ def _qmp_snapshot_tags() -> set | None:
         if dev.get("device") != "ide0-hd0":
             continue
         image = dev.get("inserted", {}).get("image", {})
-        return {s.get("name", "") for s in image.get("snapshots", [])}
+        return (
+            image.get("filename", ""),
+            {s.get("name", "") for s in image.get("snapshots", [])},
+        )
     log.error("QMP: query-block returned no ide0-hd0 device")
     return None
+
+
+def _same_image(qmp_filename: str, path: Path) -> bool:
+    """True when the image QEMU reports and `path` are the same file.
+
+    hdd_path is set by the user in xemu.toml while HDD_IMAGE is broker config,
+    so the two drift apart the moment someone repoints one of them."""
+    if not qmp_filename:
+        return False
+    try:
+        return Path(qmp_filename).resolve() == path.resolve()
+    except OSError:
+        return False
 
 
 def _qmp_pause() -> bool:
@@ -964,9 +982,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not _qmp_available():
             self._send_json(409, {"error": "xemu is not running"})
             return
-        tags = _qmp_snapshot_tags()
-        if tags is None:
+        queried = _qmp_snapshot_tags()
+        if queried is None:
             self._send_json(503, {"error": "could not query xemu for saved states"})
+            return
+        open_image, tags = queried
+        # The snapshots were read off the image xemu has open; zipping HDD_IMAGE
+        # when hdd_path points somewhere else would serve an archive that does
+        # not contain the capture, and a wrong archive is worse than an error.
+        if not _same_image(open_image, HDD_IMAGE):
+            log.error("state-file: xemu has %s open but the broker serves %s — refusing",
+                      open_image or "<unknown>", HDD_IMAGE)
+            self._send_json(500, {
+                "error": "xemu has a different hard disk image open than the broker serves",
+                "xemu_image": open_image,
+                "broker_image": str(HDD_IMAGE),
+            })
             return
         if f"broker-slot-{slot}" not in tags:
             self._send_json(404, {"error": "no state for slot", "slot": slot})
