@@ -150,6 +150,26 @@ def test_do_setup_qmp_timeout_stops_and_clears(monkeypatch):
         assert broker._state["launch_error"]
 
 
+def test_do_setup_qmp_timeout_spares_a_reused_instance(monkeypatch):
+    """Setup reused a live xemu, so a QMP hiccup is not licence to kill it —
+    that instance may be running someone's game."""
+    calls = []
+    monkeypatch.setattr(broker, "_qmp_available", lambda: True)
+    monkeypatch.setattr(
+        broker, "_launch_xemu", lambda: pytest.fail("a live instance must be reused")
+    )
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    with broker._lock:
+        broker._state["setup"] = True
+        broker._state["launch_in_progress"] = True
+    broker._do_setup()
+    assert calls == []
+    with broker._lock:
+        assert broker._state["setup"] is False
+        assert broker._state["launch_error"]
+
+
 # ── ROM launch path ───────────────────────────────────────────────────────────
 
 
@@ -187,6 +207,41 @@ def test_do_load_rom_qmp_timeout_spares_a_reused_instance(monkeypatch):
     with broker._lock:
         assert broker._state["launch_error"]
         assert broker._state["launch_in_progress"] is False
+
+
+def test_do_load_rom_kills_the_xemu_it_spawned_when_the_rom_never_loads(monkeypatch):
+    """A spawned xemu whose disc never went in has no session at all, and a
+    gameless one busy-loops CPU cores with nothing left to reap it."""
+    calls = []
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda: True)
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: False)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom("/romm/library/x.iso")
+    assert calls == ["kill"]
+    with broker._lock:
+        assert broker._state["launch_error"]
+        assert broker._state["rom_path"] is None
+        assert broker._state["launch_in_progress"] is False
+
+
+def test_do_load_rom_failed_load_spares_a_reused_instance(monkeypatch):
+    """Our disc not going in is no reason to end the game already running."""
+    calls = []
+    monkeypatch.setattr(broker, "_qmp_available", lambda: True)
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: False)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+        broker._state["rom_path"] = "/romm/library/someone-elses.iso"
+    broker._do_load_rom("/romm/library/x.iso")
+    assert calls == []
+    with broker._lock:
+        assert broker._state["launch_error"]
 
 
 def test_do_load_rom_records_a_failed_resume_without_failing_the_launch(monkeypatch):

@@ -764,6 +764,12 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None,
             # A disc went into an xemu the user had already stopped.
             log.info("Session stopped mid-launch — discarding the loaded ROM")
             _kill_xemu()
+        elif not ok and spawned:
+            # Same reasoning as the QMP-timeout branch above: this xemu has no
+            # disc and no session, and a gameless one busy-loops CPU cores with
+            # nothing left to reap it. A reused instance is someone else's game.
+            log.info("ROM load failed — stopping the xemu this launch spawned")
+            _kill_xemu()
     finally:
         with _lock:
             _state["launch_in_progress"] = False
@@ -845,7 +851,10 @@ def _do_setup(generation: int | None = None) -> None:
                     _state["launch_error"] = (
                         f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — setup aborted"
                     )
-            _kill_xemu()
+            # Reap only what this setup started: an instance we merely reused is
+            # still running someone's game.
+            if spawned:
+                _kill_xemu()
             return
 
         if _abandon_if_cancelled(generation, spawned):
