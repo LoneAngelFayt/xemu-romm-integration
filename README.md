@@ -39,6 +39,27 @@ One consequence: a save state restores the entire console, including every
 title's saves as they stood when it was captured. Restoring an old state for one
 game rolls back in-game saves for other games too.
 
+## Roadmap
+
+### Per-user hard disk, carried like a memory card
+
+The hard disk is currently a fixture of the container: one image, shared by
+whoever streams next, holding every title's in-game saves for every user on the
+platform. That is the wrong owner. It makes one player's progress visible to the
+next, it makes the image grow without bound as users accumulate, and it is why a
+state archive has to carry the whole console.
+
+The idea is to make the image a per-user asset RomM stores and hands back at
+launch, the way a memory card follows its owner rather than living in the
+console. The broker would receive the player's image with the launch and return
+it when the session ends, so the container keeps nothing between sessions.
+
+Open questions before this is worth planning: how it interacts with the save
+states above (both are the same qcow2 today), what RomM's asset model can
+already express, whether the handoff can be made cheap enough to sit in the
+launch path, and what happens when the same user streams from two places at
+once.
+
 ## State thumbnails
 
 Frames come from pixelflux, which is the compositor when selkies runs in
