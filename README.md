@@ -124,8 +124,8 @@ services:
 | `BROKER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `HDD_IMAGE` | `/config/xemu/xbox_hdd.qcow2` | Xbox hard disk image the broker reads and restores as a save state |
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
-| `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state **archive** in either direction |
-| `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs past 256MB while zipping to under 50MB, and a qcow2 never shrinks when a snapshot is deleted |
+| `STATE_FILE_MAX_BYTES` | `2147483648` | Size ceiling for a state **archive** in either direction. Set to match the expanded ceiling below so that one is what binds: a zip of a qcow2 is never bigger than the qcow2, so this is a backstop rather than a limit real saves meet. A first save is the largest one — the image is at its fattest before the trim has an older snapshot to drop |
+| `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs well past its own zipped size, and a qcow2 never shrinks when a snapshot is deleted |
 | `STATE_TRIM` | `1` | Rebuild the image around the one snapshot being served so the other slots do not ship inside the archive. `0` serves the whole image, which is also where any failed or refused rebuild falls back to |
 | `PIXELFLUX_CU` | `8085` | Container-internal port of the pixelflux Computer Use server that state thumbnails are captured from. `0` disables it. **Never publish this port** — see [State thumbnails](#state-thumbnails) |
 | `STATE_SHOT_TIMEOUT` | `10.0` | Seconds to wait for a captured frame before giving up and saving without one |

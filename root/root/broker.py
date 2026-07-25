@@ -47,11 +47,19 @@ SETUP_TIMEOUT = float(os.environ.get("SETUP_TIMEOUT", "900"))
 # into it, and there is no way to export one snapshot on its own.
 HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
 HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
-STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
-# The archive travels compressed but lands on disk expanded, so the two need
-# separate bounds. Holding the image to the transfer limit rejected real saves:
-# a qcow2 carrying one ~70MB VM state runs past 256MB while zipping to under 50,
-# and the qcow2 never shrinks when a snapshot is deleted, so it only creeps up.
+# Sized so the expanded-image ceiling below is what actually binds: a zip of a
+# qcow2 is never larger than the qcow2, so an image small enough to serve is an
+# archive small enough to send, and this stays a backstop against a runaway
+# read rather than a limit real saves run into. 256MB was the old default and
+# it rejected ordinary first saves outright — a fresh HDD image is at its
+# fattest the first time a game is saved, before the trim below has any older
+# snapshot to leave behind, and one real title trimmed to a 792MB image that
+# still zipped to 526MB there.
+STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+# The archive travels compressed but lands on disk expanded, so the two still
+# need separate bounds: a qcow2 carrying one ~70MB VM state runs past its own
+# zipped size by a wide margin, and it never shrinks when a snapshot is deleted,
+# so it only creeps up.
 HDD_IMAGE_MAX_BYTES = int(os.environ.get("HDD_IMAGE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
