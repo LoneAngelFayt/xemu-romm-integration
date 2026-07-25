@@ -103,6 +103,10 @@ _state: dict = {
     "save_in_progress": False,
     "launch_in_progress": False,  # guards against concurrent /launch requests
     "state_file_in_progress": False,  # a /state-file GET or PUT owns the disk image
+    # GET only: it reads the image with the guest paused, so it holds the QMP
+    # monitor against a live xemu. A PUT runs with xemu down and must not be
+    # mistaken for one.
+    "state_file_reading": False,
     "launch_error": None,
     "resume_error": None,         # slot resume failed but the ROM did launch
     "setup": False,               # gameless xemu is up for configuration
@@ -149,13 +153,14 @@ def _validate_rom_path(raw: str) -> Path | None:
 # ── Process lifecycle ─────────────────────────────────────────────────────────
 
 
-def _claim_state_file(deadline: float) -> str | None:
+def _claim_state_file(deadline: float, reading: bool = False) -> str | None:
     """Reserve the disk image for a /state-file transfer.
 
     Both directions touch the qcow2 the emulator owns, so they must not overlap
     each other, a snapshot job or a launch. Waits out an in-flight save until
-    `deadline` because RomM fetches straight after POST /save-state. Returns an
-    error string on conflict, None once the flag is held by this caller."""
+    `deadline` because RomM fetches straight after POST /save-state. `reading`
+    marks the GET direction, which holds the QMP monitor. Returns an error
+    string on conflict, None once the flag is held by this caller."""
     while True:
         with _lock:
             if _state["state_file_in_progress"]:
@@ -164,6 +169,7 @@ def _claim_state_file(deadline: float) -> str | None:
                 return "launch in progress"
             if not _state["save_in_progress"]:
                 _state["state_file_in_progress"] = True
+                _state["state_file_reading"] = reading
                 return None
         if time.monotonic() >= deadline:
             return "save still in progress"
@@ -173,6 +179,7 @@ def _claim_state_file(deadline: float) -> str | None:
 def _release_state_file() -> None:
     with _lock:
         _state["state_file_in_progress"] = False
+        _state["state_file_reading"] = False
 
 
 def _wait_for_no_xemu(timeout: float = 3.0) -> bool:
@@ -978,7 +985,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # RomM fetches straight after POST /save-state, whose snapshot job runs
         # in the background. Serving mid-job would ship an image without the
         # capture in it.
-        conflict = _claim_state_file(time.monotonic() + STATE_GET_WAIT)
+        conflict = _claim_state_file(time.monotonic() + STATE_GET_WAIT, reading=True)
         if conflict is not None:
             self._send_json(409, {"error": conflict})
             return
@@ -1088,7 +1095,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/status":
-            xemu_up = _qmp_available()
+            with _lock:
+                busy = _state["save_in_progress"] or _state["state_file_reading"]
+            # xemu serves one QMP client at a time, so probing during a snapshot
+            # job or a paused state-file read stalls for QMP_TIMEOUT and then
+            # reports a live session as down. Either one implies a live xemu. A
+            # /state-file PUT is deliberately not covered: it runs with xemu
+            # down, so it still gets a real probe.
+            xemu_up = True if busy else _qmp_available()
             with _lock:
                 rom_path = _state["rom_path"]
                 rom_name = _state["rom_name"]
@@ -1306,12 +1320,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     ok = _qmp_save_state(s)
                     if not ok:
                         log.warning("save-and-exit: save failed (slot %d) — exiting anyway", s)
-                    # Kill rather than return to the dashboard: an idle xemu
-                    # busy-loops several CPU cores under software rendering.
-                    _kill_xemu()
                 except Exception as exc:
                     log.error("save-and-exit: unexpected error: %s", exc)
                 finally:
+                    # Drop the session before the kill, not after. The snapshot
+                    # job is over by here, and /status reads save_in_progress as
+                    # proof xemu is up, so holding it across the SIGTERM wait
+                    # reports a session that is being torn down as still active.
                     with _lock:
                         _state["save_in_progress"] = False
                         _state["rom_path"] = None
@@ -1321,6 +1336,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         # reporting errors from it — same as DELETE /launch.
                         _state["launch_error"] = None
                         _state["resume_error"] = None
+                # Kill rather than return to the dashboard: an idle xemu
+                # busy-loops several CPU cores under software rendering.
+                _kill_xemu()
                 return ok
 
             if wait:

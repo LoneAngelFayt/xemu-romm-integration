@@ -38,6 +38,7 @@ def _reset_state():
             "save_in_progress": False,
             "launch_in_progress": False,
             "state_file_in_progress": False,
+            "state_file_reading": False,
             "launch_error": None,
             "resume_error": None,
             "setup": False,
@@ -1197,6 +1198,48 @@ def test_status_surfaces_a_failed_resume_on_an_active_session(client, rom_root, 
     assert st["active"] is True          # the session really is running
     assert st["launch_error"] is None    # the launch itself did not fail
     assert "slot 3" in st["resume_error"]
+
+
+@pytest.mark.parametrize("flag", ["save_in_progress", "state_file_reading"])
+def test_status_does_not_probe_qmp_while_a_job_holds_the_monitor(client, monkeypatch, flag):
+    """xemu serves one QMP client at a time: a routine poll landing mid-job used
+    to stall for QMP_TIMEOUT and then report a live session as stopped."""
+    probes = []
+
+    def _stalled_probe():
+        probes.append(1)
+        time.sleep(5)  # what a monitor already owned by a job really does
+        return False
+
+    monkeypatch.setattr(broker, "_qmp_available", _stalled_probe)
+    with broker._lock:
+        broker._state["rom_path"] = "/romm/library/x.iso"
+        broker._state[flag] = True
+    start = time.monotonic()
+    st = _status(client)
+    assert time.monotonic() - start < 1.0
+    assert probes == []               # the monitor was left alone
+    assert st["xemu_running"] is True  # a job in flight implies a live xemu
+    assert st["active"] is True
+
+
+def test_status_still_probes_during_a_state_file_restore(client, monkeypatch):
+    """A PUT /state-file holds state_file_in_progress with xemu DOWN, so it must
+    not be read as "a job is running, xemu must be up" — that would report a
+    stopped emulator as live for the length of the restore."""
+    probes = []
+
+    def _probe():
+        probes.append(1)
+        return False
+
+    monkeypatch.setattr(broker, "_qmp_available", _probe)
+    with broker._lock:
+        broker._state["state_file_in_progress"] = True   # PUT direction
+        broker._state["state_file_reading"] = False
+    st = _status(client)
+    assert probes == [1]
+    assert st["xemu_running"] is False
 
 
 def test_get_state_file_413_without_zipping_an_oversized_image(state_client, hdd, monkeypatch):
