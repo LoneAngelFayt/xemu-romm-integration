@@ -39,30 +39,49 @@ game rolls back in-game saves for other games too.
 
 ## State thumbnails
 
-States carry no thumbnail on xemu. `GET /state-screenshot` always returns `404`,
-which RomM treats as "this broker keeps no frames" and displays the state
-without a picture. Every way of capturing a frame inside the container is
-currently closed:
+Frames come from pixelflux, which is the compositor when selkies runs in
+Wayland mode. `init.sh` enables its Computer Use HTTP server by writing
+`PIXELFLUX_CU` into the container environment before selkies starts, so
+thumbnails need no configuration from whoever installs the mod. At save time the
+broker posts `{"action": "screenshot"}` to it and stores the base64 PNG that
+comes back beside the disk image, where `GET /state-screenshot` serves it.
+
+What comes back is the composited output — the picture the player is actually
+looking at — which is why this works where `screendump` would not.
+
+**The port is not published, and must stay that way.** The Computer Use API
+carries no credential and injects keyboard and mouse as well as capturing
+frames, so anything that can reach it drives the desktop. Unpublished it is
+reachable only from inside the container, which is where the broker runs. Set
+`PIXELFLUX_CU` to move it off the default `8085`, or to `0` to leave the server
+off and states without thumbnails.
+
+This needs a base image new enough to have the feature. pixelflux 1.6.4, which
+ships in `v0.8.134-ls76`, ignores `PIXELFLUX_CU`; the broker then logs a refused
+connection, stores no frame, and `GET /state-screenshot` returns `404` as before.
+
+Everything that could capture a frame without pixelflux is closed:
 
 | Approach | Why it fails |
 |---|---|
 | QMP `screendump` | Declared `'if': 'CONFIG_PIXMAN'` in `qapi/ui.json`, and xemu ships without pixman, so the command is not registered. `query-commands` lists 228 commands and no capture command among them |
 | Rebuilding xemu with pixman | `option('pixman')` is `auto`, not disabled, so a rebuild would register the command — but xemu [#774](https://github.com/xemu-project/xemu/issues/774) reports it dumps a stale Xbox logo. The nv2a renderer draws to the host GL surface and never populates the `DisplaySurface` that `screendump` reads, which is also why pixman is absent to begin with |
 | `xwd` against X11 | xemu creates no X window. Under Xwayland only an 8192x8192 unmapped virtual root exists, and `X_GetImage` on it fails `BadMatch` |
-| `grim` against Wayland | The compositor reports no `wlr-screencopy-unstable-v1` on one socket and never delivers a frame on the other |
+| `grim` against Wayland | pixelflux is the compositor and implements no `wlr-screencopy-unstable-v1`, so no generic Wayland client can copy the screen |
+| A second `pixelflux.ScreenCapture` | It starts its own compositor rather than attaching to the running one, so it would capture a blank framebuffer, not the game |
 
 The `ImageFormat` enum is *not* gated on pixman, so `screendump` and its `ppm`
 and `png` tokens appear in the binary's strings whether or not the command
 exists. Checking for them is not a valid test for support; ask `query-commands`.
 
-**Roadmap: capture the frame in the browser.** RomM already decodes and displays
-every frame client-side, so the one place a frame provably exists is the player
-view. Grabbing it there on save would sidestep the container entirely and give
-one capture path for every streaming emulator, replacing the per-emulator
-server-side handling (PCSX2 embeds a frame in its `.p2s`, Dolphin's broker
-captures one, xemu can do neither). The broker's `/state-screenshot` contract
-and RomM's fetch-and-store path are already built and would keep working for the
-emulators that do serve frames.
+**Why not capture in the browser.** RomM decodes and displays every frame
+client-side, so the player view looks like the obvious place to grab one, and it
+is how EmulatorJS states get their images — `gameManager.screenshot()` reads its
+own canvas, and RomM's state upload already carries an optional screenshot file.
+The streaming player cannot do the same: it embeds the container's selkies UI in
+a cross-origin iframe, and a parent document cannot read pixels out of one. It
+would only work where RomM and the emulator container happen to share an origin,
+which is not the normal deployment.
 
 ## Usage
 
@@ -105,6 +124,8 @@ services:
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
 | `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state **archive** in either direction |
 | `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs past 256MB while zipping to under 50MB, and a qcow2 never shrinks when a snapshot is deleted |
+| `PIXELFLUX_CU` | `8085` | Container-internal port of the pixelflux Computer Use server that state thumbnails are captured from. `0` disables it. **Never publish this port** — see [State thumbnails](#state-thumbnails) |
+| `STATE_SHOT_TIMEOUT` | `10.0` | Seconds to wait for a captured frame before giving up and saving without one |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
 | `STOP_WAIT` | `5.0` | Max seconds `DELETE /launch` waits for an in-flight `/state-file` transfer or snapshot job before stopping xemu anyway |
 | `BROKER_REQUEST_TIMEOUT` | `60.0` | Per-socket HTTP request timeout; a client that stalls mid-request is dropped rather than holding a handler thread |
@@ -120,7 +141,7 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 | `/health` | GET | `{"status": "ok"}` |
 | `/status` | GET | Session state — see below |
 | `/state-file?slot=N` | GET | The zipped Xbox hard disk image holding slot N's capture, named by `X-State-Filename` |
-| `/state-screenshot?slot=N` | GET | The PNG frame captured when slot N was saved. Always `404` on xemu today — see [State thumbnails](#state-thumbnails) |
+| `/state-screenshot?slot=N` | GET | The PNG frame captured when slot N was saved, or `404` if none was — see [State thumbnails](#state-thumbnails) |
 
 **`GET /status` response:**
 ```json

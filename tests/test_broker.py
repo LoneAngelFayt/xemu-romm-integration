@@ -5,6 +5,7 @@ exercise the state machine plus the HTTP contract against a real (but xemu-less)
 server, with the process/QMP helpers mocked out.
 """
 
+import base64
 import io
 import json
 import os
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.request
 import zipfile
 import zlib
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -1325,59 +1326,95 @@ def test_qcow2_snapshot_tags_none_when_count_overruns_the_file(tmp_path):
 # ── State frames ──────────────────────────────────────────────────────────────
 
 
-def _ppm(width, height, pixels, maxval=255, comment=b""):
-    return b"P6\n" + comment + b"%d %d\n%d\n" % (width, height, maxval) + pixels
+def _png(width=1, height=1, pixel=b"\xff\x00\x00"):
+    """A real, minimal PNG, so the tests assert on bytes RomM would accept."""
+    def chunk(kind, data):
+        crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return len(data).to_bytes(4, "big") + kind + data + crc.to_bytes(4, "big")
+
+    raw = (b"\x00" + pixel * width) * height
+    return (
+        broker._PNG_MAGIC
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
+    )
 
 
-def _png_parts(png):
-    """Split a PNG into (width, height, raw scanline bytes)."""
-    assert png[:8] == broker._PNG_MAGIC
-    pos, chunks = 8, {}
-    while pos < len(png):
-        size = int.from_bytes(png[pos:pos + 4], "big")
-        kind = png[pos + 4:pos + 8]
-        data = png[pos + 8:pos + 8 + size]
-        assert zlib.crc32(kind + data) == int.from_bytes(
-            png[pos + 8 + size:pos + 12 + size], "big"
-        ), f"{kind!r} chunk CRC is wrong"
-        chunks.setdefault(kind, b"")
-        chunks[kind] += data
-        pos += 12 + size
-    assert b"IEND" in chunks
-    width, height, depth, colour = struct.unpack(">IIBB", chunks[b"IHDR"][:10])
-    assert (depth, colour) == (8, 2)  # 8-bit truecolor
-    return width, height, zlib.decompress(chunks[b"IDAT"])
+@pytest.fixture
+def cu_server(monkeypatch):
+    """Stand in for pixelflux's Computer Use server on loopback.
+
+    A real socket rather than a patched urlopen: posting the wrong action or
+    hitting the wrong path is exactly the failure worth catching, and neither
+    shows up when the transport itself is mocked away."""
+    state = {
+        "payload": {"data": base64.b64encode(_png()).decode()},
+        "requests": [],
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            state["requests"].append((self.path, json.loads(body)))
+            blob = json.dumps(state["payload"]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(broker, "CU_PORT", str(srv.server_address[1]))
+    yield state
+    srv.shutdown()
+    srv.server_close()
 
 
-def test_ppm_to_png_round_trips_pixels():
-    pixels = bytes(range(18))  # 3x2 RGB
-    width, height, raw = _png_parts(broker._ppm_to_png(_ppm(3, 2, pixels)))
-    assert (width, height) == (3, 2)
-    # Every scanline carries a leading filter byte of 0.
-    assert raw == b"\x00" + pixels[:9] + b"\x00" + pixels[9:]
+def test_capture_frame_png_returns_the_decoded_image(cu_server):
+    assert broker._capture_frame_png() == _png()
 
 
-def test_ppm_to_png_skips_header_comments():
-    """xemu writes no comment, but the PPM grammar allows one anywhere."""
-    png = broker._ppm_to_png(_ppm(1, 1, b"\x01\x02\x03", comment=b"# xemu\n"))
-    assert _png_parts(png) == (1, 1, b"\x00\x01\x02\x03")
+def test_capture_frame_png_asks_for_a_screenshot(cu_server):
+    broker._capture_frame_png()
+    assert cu_server["requests"] == [("/computer-use", {"action": "screenshot"})]
 
 
-def test_ppm_to_png_rejects_a_non_ppm():
-    assert broker._ppm_to_png(b"\x89PNG\r\n\x1a\nalready a png") is None
+def test_capture_frame_png_none_without_a_port(monkeypatch):
+    """No PIXELFLUX_CU means no capture server, so nothing is attempted."""
+    monkeypatch.setattr(broker, "CU_PORT", "")
+    assert broker._capture_frame_png() is None
 
 
-def test_ppm_to_png_rejects_16_bit_samples():
-    assert broker._ppm_to_png(_ppm(1, 1, b"\x00" * 6, maxval=65535)) is None
+def test_capture_frame_png_none_when_nothing_is_listening(monkeypatch):
+    """Base images predating Computer Use ignore PIXELFLUX_CU, so the port is
+    set but refuses the connection. That must degrade to no thumbnail."""
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    monkeypatch.setattr(broker, "CU_PORT", str(port))
+    assert broker._capture_frame_png() is None
 
 
-def test_ppm_to_png_rejects_short_pixel_data():
-    """A truncated capture would otherwise become a PNG of garbage."""
-    assert broker._ppm_to_png(_ppm(4, 4, b"\x00" * 12)) is None
+def test_capture_frame_png_none_when_the_reply_has_no_image(cu_server):
+    cu_server["payload"] = {"result": "ok"}
+    assert broker._capture_frame_png() is None
 
 
-def test_ppm_to_png_rejects_a_truncated_header():
-    assert broker._ppm_to_png(b"P6\n64 ") is None
+def test_capture_frame_png_none_when_the_image_is_not_base64(cu_server):
+    cu_server["payload"] = {"data": "not base64 !!"}
+    assert broker._capture_frame_png() is None
+
+
+def test_capture_frame_png_none_when_the_image_is_not_a_png(cu_server):
+    """RomM drops a non-PNG, so a wrong format is caught before it is stored."""
+    cu_server["payload"] = {"data": base64.b64encode(b"GIF89a").decode()}
+    assert broker._capture_frame_png() is None
 
 
 @pytest.fixture
@@ -1386,36 +1423,21 @@ def shots(tmp_path, monkeypatch):
     return tmp_path / "shots"
 
 
-def test_capture_state_shot_writes_a_png(shots, monkeypatch):
-    def _screendump(cmd, args):
-        assert cmd == "screendump"
-        Path(args["filename"]).write_bytes(_ppm(1, 1, b"\xff\x00\x00"))
-        return {}
-
-    monkeypatch.setattr(broker, "_qmp_command", _screendump)
+def test_capture_state_shot_writes_a_png(shots, cu_server):
     assert broker._capture_state_shot(4) is True
-    assert (shots / "state-slot-4.png").read_bytes()[:8] == broker._PNG_MAGIC
+    assert (shots / "state-slot-4.png").read_bytes() == _png()
 
 
-def test_capture_state_shot_removes_its_temp_ppm(shots, monkeypatch):
-    dumps = []
-
-    def _screendump(cmd, args):
-        dumps.append(Path(args["filename"]))
-        dumps[-1].write_bytes(_ppm(1, 1, b"\x00\x00\x00"))
-        return {}
-
-    monkeypatch.setattr(broker, "_qmp_command", _screendump)
-    broker._capture_state_shot(4)
-    assert dumps and not dumps[0].exists()
-
-
-def test_capture_state_shot_false_when_qmp_fails(shots, monkeypatch):
-    monkeypatch.setattr(
-        broker, "_qmp_command", lambda c, a: (_ for _ in ()).throw(OSError("no socket"))
-    )
+def test_capture_state_shot_false_when_the_capture_fails(shots, monkeypatch):
+    monkeypatch.setattr(broker, "_capture_frame_png", lambda: None)
     assert broker._capture_state_shot(4) is False
     assert not (shots / "state-slot-4.png").exists()
+
+
+def test_capture_state_shot_leaves_no_partial_file(shots, cu_server):
+    """The frame is written via a temp name, so a reader never sees a half PNG."""
+    broker._capture_state_shot(4)
+    assert sorted(p.name for p in shots.iterdir()) == ["state-slot-4.png"]
 
 
 def test_save_state_replaces_the_frame(shots, monkeypatch):

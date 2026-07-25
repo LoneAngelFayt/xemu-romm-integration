@@ -6,6 +6,8 @@ socket flag) when a ROM is launched and kills it when the session ends.
 xemu is QEMU-based and busy-loops several CPU cores while idling at the
 dashboard, so no gameless instance is ever kept around."""
 
+import base64
+import binascii
 import hmac
 import io
 import json
@@ -19,6 +21,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.request
 import zipfile
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -56,6 +59,11 @@ STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 # asks for the frame during the pull, by which time /save-and-exit has already
 # killed the process that could have drawn it.
 STATE_SHOT_DIR = Path(os.environ.get("STATE_SHOT_DIR", str(HDD_IMAGE.parent)))
+
+# Port of the pixelflux Computer Use server that frames are captured from, set
+# by init.sh. Empty means no capture server, and states then carry no thumbnail.
+CU_PORT = os.environ.get("PIXELFLUX_CU", "").strip()
+CU_TIMEOUT = float(os.environ.get("STATE_SHOT_TIMEOUT", "10.0"))
 
 # DELETE /launch gives an in-flight /state-file transfer or snapshot job this
 # long to finish before killing xemu anyway — the transfer holds the guest
@@ -553,62 +561,50 @@ def _qmp_resume() -> bool:
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def _png_chunk(kind: bytes, data: bytes) -> bytes:
-    crc = zlib.crc32(kind + data) & 0xFFFFFFFF
-    return len(data).to_bytes(4, "big") + kind + data + crc.to_bytes(4, "big")
+def _capture_frame_png() -> bytes | None:
+    """Ask pixelflux for a PNG of what is on screen right now.
 
+    In Wayland mode pixelflux is the compositor and implements no screencopy
+    protocol, so its Computer Use server is the only frame source inside the
+    container: QMP screendump needs pixman xemu does not build, and xwd and grim
+    both come up empty. What comes back is the composited output — the picture
+    the player is actually looking at — so it does not suffer xemu #774, where
+    screendump returns a stale Xbox logo because nv2a never populates the
+    DisplaySurface it reads.
 
-def _ppm_to_png(data: bytes) -> bytes | None:
-    """Re-encode a binary PPM (P6) frame as PNG.
-
-    xemu's screendump writes PPM only: the QAPI ImageFormat enum is there, but
-    the binary links no libpng, so asking for png fails at runtime. RomM drops
-    anything that is not a PNG, so the conversion happens here."""
-    if not data.startswith(b"P6"):
-        log.warning("state-shot: capture is not a P6 PPM")
+    The port is container-internal and must stay unpublished: the API carries no
+    credential and injects keyboard and mouse as well as capturing frames."""
+    if not CU_PORT:
         return None
-    # Three whitespace-separated numbers follow the magic, with '#' comments
-    # allowed between them.
-    fields, pos = [], 2
-    while len(fields) < 3:
-        while pos < len(data) and data[pos:pos + 1].isspace():
-            pos += 1
-        if data[pos:pos + 1] == b"#":
-            while pos < len(data) and data[pos:pos + 1] != b"\n":
-                pos += 1
-            continue
-        start = pos
-        while pos < len(data) and not data[pos:pos + 1].isspace():
-            pos += 1
-        if pos == start:
-            log.warning("state-shot: PPM header is truncated")
-            return None
-        try:
-            fields.append(int(data[start:pos]))
-        except ValueError:
-            log.warning("state-shot: PPM header holds a non-numeric field")
-            return None
-    width, height, maxval = fields
-    pos += 1  # exactly one whitespace byte closes the header
-    if maxval != 255:
-        log.warning("state-shot: PPM maxval %d is not 8-bit", maxval)
-        return None
-    stride = width * 3
-    pixels = data[pos:]
-    if width <= 0 or height <= 0 or len(pixels) < stride * height:
-        log.warning("state-shot: PPM pixel data is short for %dx%d", width, height)
-        return None
-    # PPM rows are already PNG's truecolor layout; each scanline just needs a
-    # leading filter byte, and 0 means "no filter".
-    raw = b"".join(
-        b"\x00" + pixels[y * stride:(y + 1) * stride] for y in range(height)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{CU_PORT}/computer-use",
+        data=json.dumps({"action": "screenshot"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    return (
-        _PNG_MAGIC
-        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
-        + _png_chunk(b"IEND", b"")
-    )
+    try:
+        with urllib.request.urlopen(req, timeout=CU_TIMEOUT) as resp:
+            payload = json.loads(resp.read())
+    except (OSError, ValueError) as exc:
+        # Older base images ship a pixelflux that ignores PIXELFLUX_CU, so a
+        # refused connection here means "no capture server", not a failure.
+        log.warning("state-shot: pixelflux capture failed: %s", exc)
+        return None
+    encoded = payload.get("data") if isinstance(payload, dict) else None
+    if not encoded:
+        log.warning("state-shot: pixelflux returned no image data")
+        return None
+    try:
+        png = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        log.warning("state-shot: pixelflux image was not valid base64: %s", exc)
+        return None
+    # RomM drops anything that is not a PNG, so a wrong format is caught here
+    # rather than becoming a broken thumbnail after the upload.
+    if not png.startswith(_PNG_MAGIC):
+        log.warning("state-shot: pixelflux image is not a PNG")
+        return None
+    return png
 
 
 def _state_shot_path(slot: int) -> Path:
@@ -643,19 +639,7 @@ def _capture_state_shot(slot: int) -> bool:
     Taken at save time on purpose: RomM fetches the frame after the state pull,
     and by then /save-and-exit has killed xemu, so capturing on request would
     always come too late."""
-    ppm = Path(f"/tmp/xemu-shot-{slot}.ppm")
-    try:
-        # The QMP reply only lands once QEMU has finished writing the file.
-        _qmp_command("screendump", {"filename": str(ppm)})
-        png = _ppm_to_png(ppm.read_bytes())
-    except (OSError, ValueError) as exc:
-        log.warning("state-shot: capture for slot %d failed: %s", slot, exc)
-        return False
-    finally:
-        try:
-            ppm.unlink(missing_ok=True)
-        except OSError:
-            pass
+    png = _capture_frame_png()
     if png is None:
         return False
     target = _state_shot_path(slot)

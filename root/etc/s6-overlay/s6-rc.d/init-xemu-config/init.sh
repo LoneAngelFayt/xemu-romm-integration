@@ -11,6 +11,34 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[xemu-broker-mod] Cleaned up stale display sockets."
 
+# ── State thumbnail capture ──────────────────────────────────────────────────
+# In Wayland mode pixelflux is the compositor and implements no screencopy
+# protocol, so grim, xwd and QMP screendump all come up empty. The one frame
+# source left is the Computer Use HTTP server pixelflux can start itself, which
+# PIXELFLUX_CU turns on by naming its port. It is written into the s6 container
+# environment here so the selkies service inherits it when it starts after this
+# init, which means thumbnails need no configuration from whoever installs the
+# mod. Base images older than the Computer Use feature simply ignore it, and
+# the broker then logs a refused connection and stores no frame.
+#
+# The port must never be published. The API carries no credential and injects
+# keyboard and mouse as well as capturing frames, so anything that can reach it
+# drives the desktop. Unpublished it is reachable only from inside the
+# container, which is where the broker asking for the frame runs.
+#
+# Set PIXELFLUX_CU to move it, or to 0 to leave the server off entirely.
+CU_PORT="${PIXELFLUX_CU:-8085}"
+if [ "${PIXELFLUX_WAYLAND,,}" != "true" ]; then
+    echo "[xemu-broker-mod] Not in Wayland mode — no capture server; states will have no thumbnails."
+elif [ "$CU_PORT" = "0" ]; then
+    echo "[xemu-broker-mod] PIXELFLUX_CU=0 — capture server disabled; states will have no thumbnails."
+elif mkdir -p /run/s6/container_environment \
+     && printf '%s' "$CU_PORT" > /run/s6/container_environment/PIXELFLUX_CU; then
+    echo "[xemu-broker-mod] Frame capture server enabled on port $CU_PORT (container-internal — do not publish it)."
+else
+    echo "[xemu-broker-mod] WARNING: could not set PIXELFLUX_CU; states will have no thumbnails."
+fi
+
 # ── python3 availability ─────────────────────────────────────────────────────
 # python3 runs the broker itself plus both config steps below. A failed install
 # used to surface only as xemu never starting, so it is reported here in full;
