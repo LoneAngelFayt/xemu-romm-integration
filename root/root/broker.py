@@ -360,10 +360,17 @@ def _qmp_reset_confirmed(retries: int = 3) -> bool:
             sock.connect(str(QMP_SOCKET))
             recv_msg()  # greeting
             sock.sendall(json.dumps({"execute": "qmp_capabilities"}).encode() + b"\n")
-            sock.settimeout(QMP_WAIT)
-            # drain return
-            while "return" not in recv_msg():
-                pass
+            # Drain to the return under the same per-recv cap the wait loop
+            # below uses: re-arming QMP_WAIT per message lets a peer that keeps
+            # emitting events just under the timeout pin this thread for good.
+            cap_deadline = time.monotonic() + QMP_WAIT
+            while True:
+                remaining = cap_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("qmp_capabilities was never acknowledged")
+                sock.settimeout(remaining)
+                if "return" in recv_msg():
+                    break
             sock.sendall(json.dumps({"execute": "system_reset"}).encode() + b"\n")
             # Each recv is capped at what is left of the budget: a full QMP_WAIT
             # timeout on a recv entered just under the deadline would stretch the
@@ -539,7 +546,15 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
         if args:
             payload["arguments"] = args
         sock.sendall(json.dumps(payload).encode() + b"\n")
+        # The whole reply wait is capped, not each recv: a peer emitting async
+        # events just under the timeout would otherwise re-arm QMP_WAIT forever
+        # and pin this thread.
+        cmd_deadline = time.monotonic() + QMP_WAIT
         while True:
+            remaining = cmd_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"QMP {execute} did not return within {QMP_WAIT:.0f}s")
+            sock.settimeout(remaining)
             msg = recv_msg()
             if "return" in msg:
                 return msg

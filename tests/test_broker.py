@@ -458,6 +458,212 @@ def test_reset_wait_stays_within_one_qmp_wait(tmp_path, monkeypatch):
     assert elapsed < 1.5, f"wait ran {elapsed:.2f}s, over the {broker.QMP_WAIT}s budget"
 
 
+def _serve_endless_events(sock_path, quiet_after):
+    """A QMP peer that answers `quiet_after` commands and then only ever emits
+    async events — the shape that used to re-arm QMP_WAIT on every recv."""
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+
+    def _serve():
+        conn, _ = srv.accept()
+        conn.settimeout(15)
+        conn.sendall(b'{"QMP": {"version": {}}}\n')
+        answered = 0
+        buf = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    del line
+                    if answered < quiet_after:
+                        answered += 1
+                        conn.sendall(b'{"return": {}}\n')
+                        continue
+                    # Chatter forever, always inside the per-recv timeout.
+                    for _ in range(30):
+                        time.sleep(0.2)
+                        conn.sendall(b'{"event": "RTC_CHANGE"}\n')
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    return srv
+
+
+def test_snapshot_command_drain_gives_up_on_a_peer_that_never_returns(tmp_path, monkeypatch):
+    """send_cmd used to re-arm QMP_WAIT per recv, so a chatty peer pinned the
+    handler thread for good instead of failing the snapshot."""
+    sock_path = tmp_path / "qmp.sock"
+    srv = _serve_endless_events(sock_path, quiet_after=2)  # capabilities, job-dismiss
+    monkeypatch.setattr(broker, "QMP_SOCKET", sock_path)
+    monkeypatch.setattr(broker, "QMP_TIMEOUT", 2.0)
+    monkeypatch.setattr(broker, "QMP_WAIT", 1.0)
+    monkeypatch.setattr(broker, "_qmp_get_hdd_node", lambda: "node0")
+
+    start = time.monotonic()
+    try:
+        assert broker._qmp_snapshot("snapshot-save", "broker-slot-1") is False
+    finally:
+        srv.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"send_cmd ran {elapsed:.2f}s on a {broker.QMP_WAIT}s budget"
+
+
+def test_reset_capability_drain_gives_up_on_a_peer_that_never_returns(tmp_path, monkeypatch):
+    """Same overrun in the reset path's drain-to-return loop."""
+    sock_path = tmp_path / "qmp.sock"
+    srv = _serve_endless_events(sock_path, quiet_after=0)  # not even capabilities
+    monkeypatch.setattr(broker, "QMP_SOCKET", sock_path)
+    monkeypatch.setattr(broker, "QMP_TIMEOUT", 2.0)
+    monkeypatch.setattr(broker, "QMP_WAIT", 1.0)
+
+    start = time.monotonic()
+    try:
+        assert broker._qmp_reset_confirmed(retries=1) is False
+    finally:
+        srv.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"drain ran {elapsed:.2f}s on a {broker.QMP_WAIT}s budget"
+
+
+def _serve_snapshot_job(sock_path, job_error=None, job_id="broker-slot-1"):
+    """A QMP peer that concludes a snapshot job, optionally with an error.
+
+    Returns (server_socket, received) — `received` accumulates executed commands
+    so the teardown sequence can be asserted on."""
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+    received = []
+
+    def _event(jid, status):
+        return json.dumps({
+            "event": "JOB_STATUS_CHANGE", "data": {"id": jid, "status": status},
+        }).encode() + b"\n"
+
+    def _serve():
+        conn, _ = srv.accept()
+        conn.settimeout(15)
+        conn.sendall(b'{"QMP": {"version": {}}}\n')
+        buf = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    cmd = json.loads(line).get("execute")
+                    received.append(cmd)
+                    if cmd == "query-jobs":
+                        job = {"id": job_id, "status": "concluded"}
+                        if job_error is not None:
+                            job["error"] = job_error
+                        conn.sendall(json.dumps({"return": [job]}).encode() + b"\n")
+                    else:
+                        conn.sendall(b'{"return": {}}\n')
+                    if cmd == "snapshot-save":
+                        # Another job concludes first: the wait keys on the id.
+                        conn.sendall(_event("someone-elses-job", "concluded"))
+                        conn.sendall(_event(job_id, "concluded"))
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    return srv, received
+
+
+@pytest.fixture
+def snapshot_qmp(tmp_path, monkeypatch):
+    """Point the snapshot helper at a scratch QMP socket with a short budget."""
+    monkeypatch.setattr(broker, "QMP_SOCKET", tmp_path / "qmp.sock")
+    monkeypatch.setattr(broker, "QMP_TIMEOUT", 2.0)
+    monkeypatch.setattr(broker, "QMP_WAIT", 2.0)
+    monkeypatch.setattr(broker, "_qmp_get_hdd_node", lambda: "node0")
+    return tmp_path / "qmp.sock"
+
+
+def test_qmp_snapshot_succeeds_when_the_job_concludes(snapshot_qmp):
+    """RomM pulls a state file on the strength of this return value."""
+    srv, received = _serve_snapshot_job(snapshot_qmp)
+    try:
+        assert broker._qmp_snapshot("snapshot-save", "broker-slot-1") is True
+    finally:
+        srv.close()
+    assert "snapshot-save" in received
+    assert "query-jobs" in received     # the job is asked whether it errored
+    assert received[-1] == "job-dismiss"  # and a concluded job is cleared away
+    assert "job-cancel" not in received
+
+
+def test_qmp_snapshot_fails_when_the_job_concludes_with_an_error(snapshot_qmp):
+    """A concluded job is not a successful one — QEMU reports the failure in
+    query-jobs, and reporting True here would have RomM pull an empty state."""
+    srv, received = _serve_snapshot_job(snapshot_qmp, job_error="No space left on device")
+    try:
+        assert broker._qmp_snapshot("snapshot-save", "broker-slot-1") is False
+    finally:
+        srv.close()
+    assert received[-1] == "job-dismiss"  # still cleared, so the id is reusable
+
+
+def test_qmp_snapshot_passes_the_node_and_tag_through(snapshot_qmp):
+    """snapshot-save must name the block node and carry the vmstate with it."""
+    sent = []
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(snapshot_qmp))
+    srv.listen(1)
+
+    def _serve():
+        conn, _ = srv.accept()
+        conn.settimeout(15)
+        conn.sendall(b'{"QMP": {"version": {}}}\n')
+        buf = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+                while b"\n" in buf:
+                    line, _, buf = buf.partition(b"\n")
+                    msg = json.loads(line)
+                    sent.append(msg)
+                    conn.sendall(b'{"return": []}\n')
+                    if msg.get("execute") == "snapshot-save":
+                        conn.sendall(json.dumps({
+                            "event": "JOB_STATUS_CHANGE",
+                            "data": {"id": "broker-slot-7", "status": "concluded"},
+                        }).encode() + b"\n")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    try:
+        assert broker._qmp_snapshot("snapshot-save", "broker-slot-7") is True
+    finally:
+        srv.close()
+    save = next(m for m in sent if m.get("execute") == "snapshot-save")
+    assert save["arguments"] == {
+        "job-id": "broker-slot-7",
+        "tag": "broker-slot-7",
+        "devices": ["node0"],
+        "vmstate": "node0",
+    }
+
+
 # ── ROM path validation ───────────────────────────────────────────────────────
 
 
