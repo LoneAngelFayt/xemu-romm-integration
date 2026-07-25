@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import socket as _socket
+import struct
 import subprocess
 import sys
 import time
@@ -45,6 +46,11 @@ HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
 HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
 STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
+
+# Captured state frames sit beside the disk image so they outlive xemu: RomM
+# asks for the frame during the pull, by which time /save-and-exit has already
+# killed the process that could have drawn it.
+STATE_SHOT_DIR = Path(os.environ.get("STATE_SHOT_DIR", str(HDD_IMAGE.parent)))
 
 # DELETE /launch gives an in-flight /state-file transfer or snapshot job this
 # long to finish before killing xemu anyway — the transfer holds the guest
@@ -458,6 +464,55 @@ def _qmp_snapshot_tags() -> tuple[str, set] | None:
     return None
 
 
+_QCOW2_MAGIC = b"QFI\xfb"
+# One snapshot table entry: l1_table_offset, l1_size, id_str_size, name_size,
+# date_sec, date_nsec, vm_clock_nsec, vm_state_size, extra_data_size. The
+# variable-length extra_data, id_str and name follow, padded to 8 bytes.
+_QCOW2_SNAPSHOT_ENTRY = ">QIHHIIQII"
+
+
+def _qcow2_snapshot_tags(path: Path) -> set | None:
+    """Every internal snapshot tag on a qcow2, read from the file itself.
+
+    The offline twin of _qmp_snapshot_tags. Once xemu exits nothing holds the
+    image open, so the on-disk snapshot table is the authority and a state
+    written by /save-and-exit stays reachable after the process is gone.
+
+    Returns None when the file cannot be read or parsed — an empty set means
+    "this image holds no snapshots", so a failure is never reported that way."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(72)
+            if len(head) < 72 or head[:4] != _QCOW2_MAGIC:
+                log.error("state-file: %s is not a qcow2", path)
+                return None
+            # qcow2 header: nb_snapshots is a u32 at byte 60, snapshots_offset
+            # a u64 at byte 64.
+            count = int.from_bytes(head[60:64], "big")
+            if not count:
+                return set()
+            fh.seek(int.from_bytes(head[64:72], "big"))
+            tags = set()
+            for _ in range(count):
+                entry = fh.read(40)
+                if len(entry) < 40:
+                    raise ValueError("snapshot table ends mid-entry")
+                _, _, id_len, name_len, _, _, _, _, extra_len = struct.unpack(
+                    _QCOW2_SNAPSHOT_ENTRY, entry
+                )
+                fh.read(extra_len)
+                fh.read(id_len)
+                name = fh.read(name_len)
+                if len(name) < name_len:
+                    raise ValueError("snapshot table ends mid-name")
+                tags.add(name.decode("utf-8", "replace"))
+                fh.read(-(extra_len + id_len + name_len) % 8)
+            return tags
+    except (OSError, ValueError, struct.error) as exc:
+        log.error("state-file: could not read snapshots from %s: %s", path, exc)
+        return None
+
+
 def _same_image(qmp_filename: str, path: Path) -> bool:
     """True when the image QEMU reports and `path` are the same file.
 
@@ -490,11 +545,137 @@ def _qmp_resume() -> bool:
         return False
 
 
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(kind + data) & 0xFFFFFFFF
+    return len(data).to_bytes(4, "big") + kind + data + crc.to_bytes(4, "big")
+
+
+def _ppm_to_png(data: bytes) -> bytes | None:
+    """Re-encode a binary PPM (P6) frame as PNG.
+
+    xemu's screendump writes PPM only: the QAPI ImageFormat enum is there, but
+    the binary links no libpng, so asking for png fails at runtime. RomM drops
+    anything that is not a PNG, so the conversion happens here."""
+    if not data.startswith(b"P6"):
+        log.warning("state-shot: capture is not a P6 PPM")
+        return None
+    # Three whitespace-separated numbers follow the magic, with '#' comments
+    # allowed between them.
+    fields, pos = [], 2
+    while len(fields) < 3:
+        while pos < len(data) and data[pos:pos + 1].isspace():
+            pos += 1
+        if data[pos:pos + 1] == b"#":
+            while pos < len(data) and data[pos:pos + 1] != b"\n":
+                pos += 1
+            continue
+        start = pos
+        while pos < len(data) and not data[pos:pos + 1].isspace():
+            pos += 1
+        if pos == start:
+            log.warning("state-shot: PPM header is truncated")
+            return None
+        try:
+            fields.append(int(data[start:pos]))
+        except ValueError:
+            log.warning("state-shot: PPM header holds a non-numeric field")
+            return None
+    width, height, maxval = fields
+    pos += 1  # exactly one whitespace byte closes the header
+    if maxval != 255:
+        log.warning("state-shot: PPM maxval %d is not 8-bit", maxval)
+        return None
+    stride = width * 3
+    pixels = data[pos:]
+    if width <= 0 or height <= 0 or len(pixels) < stride * height:
+        log.warning("state-shot: PPM pixel data is short for %dx%d", width, height)
+        return None
+    # PPM rows are already PNG's truecolor layout; each scanline just needs a
+    # leading filter byte, and 0 means "no filter".
+    raw = b"".join(
+        b"\x00" + pixels[y * stride:(y + 1) * stride] for y in range(height)
+    )
+    return (
+        _PNG_MAGIC
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _state_shot_path(slot: int) -> Path:
+    return STATE_SHOT_DIR / f"state-slot-{slot}.png"
+
+
+def _delete_state_shot(slot: int) -> None:
+    """Drop a slot's frame so an overwritten save never keeps the old one."""
+    try:
+        _state_shot_path(slot).unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("state-shot: could not remove the frame for slot %d: %s", slot, exc)
+
+
+def _delete_all_state_shots() -> None:
+    """Drop every frame, for when the image they were captured from is gone."""
+    try:
+        shots = list(STATE_SHOT_DIR.glob("state-slot-*.png"))
+    except OSError as exc:
+        log.warning("state-shot: could not list %s: %s", STATE_SHOT_DIR, exc)
+        return
+    for shot in shots:
+        try:
+            shot.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("state-shot: could not remove %s: %s", shot, exc)
+
+
+def _capture_state_shot(slot: int) -> bool:
+    """Save the current frame for `slot` as a PNG beside the disk image.
+
+    Taken at save time on purpose: RomM fetches the frame after the state pull,
+    and by then /save-and-exit has killed xemu, so capturing on request would
+    always come too late."""
+    ppm = Path(f"/tmp/xemu-shot-{slot}.ppm")
+    try:
+        # The QMP reply only lands once QEMU has finished writing the file.
+        _qmp_command("screendump", {"filename": str(ppm)})
+        png = _ppm_to_png(ppm.read_bytes())
+    except (OSError, ValueError) as exc:
+        log.warning("state-shot: capture for slot %d failed: %s", slot, exc)
+        return False
+    finally:
+        try:
+            ppm.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if png is None:
+        return False
+    target = _state_shot_path(slot)
+    tmp = target.with_name(f".{target.name}.tmp")
+    try:
+        STATE_SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(png)
+        os.replace(tmp, target)
+    except OSError as exc:
+        log.warning("state-shot: could not write %s: %s", target, exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    log.info("state-shot: captured slot %d (%d bytes)", slot, len(png))
+    return True
+
+
 def _zip_hdd_image() -> bytes | None:
     """Zip the hard disk image into memory.
 
-    The caller must have paused the guest first: this is a qcow2 a live QEMU
-    holds open, and a copy taken mid-write can catch torn metadata."""
+    With xemu up the caller must pause the guest first: this is a qcow2 a live
+    QEMU holds open, and a copy taken mid-write can catch torn metadata. With
+    xemu gone the image is quiescent and no pause is possible or needed."""
     buf = io.BytesIO()
     try:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -542,6 +723,9 @@ def _restore_hdd_image(content: bytes) -> str | None:
         except OSError as exc:
             drop_tmp()
             return f"could not write the hard disk image: {exc}"
+    # The frames describe snapshots in the image just replaced, so keeping them
+    # would caption the restored states with the previous session's pictures.
+    _delete_all_state_shots()
     return None
 
 
@@ -666,6 +850,10 @@ def _qmp_save_state(slot: int) -> bool:
     ok = _qmp_snapshot("snapshot-save", tag)
     if ok:
         log.info("QMP: snapshot saved %s", tag)
+        # Best-effort: a missing frame costs the state its thumbnail and nothing
+        # else, but a stale one would show the wrong save.
+        if not _capture_state_shot(slot):
+            _delete_state_shot(slot)
     else:
         log.error("QMP: snapshot save %s failed", tag)
     return ok
@@ -994,28 +1182,69 @@ class BrokerHandler(BaseHTTPRequestHandler):
         finally:
             _release_state_file()
 
+    def _get_state_screenshot(self):
+        """Serve the frame captured when the slot was saved.
+
+        Deliberately independent of QMP: RomM asks for this after the pull, with
+        xemu already gone, so the answer has to come off disk."""
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            slot = int(query.get("slot", ["0"])[0])
+        except ValueError:
+            self._send_json(400, {"error": "slot must be an integer"})
+            return
+        if not (1 <= slot <= 10):
+            self._send_json(400, {"error": "slot must be 1-10"})
+            return
+        try:
+            content = _state_shot_path(slot).read_bytes()
+        except OSError:
+            # Also the normal answer for a state saved before frames were kept.
+            self._send_json(404, {"error": "no frame for slot", "slot": slot})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
     def _serve_state_file(self, slot: int):
-        """Pause, zip and serve the disk image. Caller holds the state-file flag."""
-        if not _qmp_available():
-            self._send_json(409, {"error": "xemu is not running"})
-            return
-        queried = _qmp_snapshot_tags()
-        if queried is None:
-            self._send_json(503, {"error": "could not query xemu for saved states"})
-            return
-        open_image, tags = queried
-        # The snapshots were read off the image xemu has open; zipping HDD_IMAGE
-        # when hdd_path points somewhere else would serve an archive that does
-        # not contain the capture, and a wrong archive is worse than an error.
-        if not _same_image(open_image, HDD_IMAGE):
-            log.error("state-file: xemu has %s open but the broker serves %s — refusing",
-                      open_image or "<unknown>", HDD_IMAGE)
-            self._send_json(500, {
-                "error": "xemu has a different hard disk image open than the broker serves",
-                "xemu_image": open_image,
-                "broker_image": str(HDD_IMAGE),
-            })
-            return
+        """Zip and serve the disk image. Caller holds the state-file flag.
+
+        With xemu up the guest is paused around the read. With xemu gone there is
+        nothing to pause and the snapshot table is read off the image directly —
+        which is what /save-and-exit needs, since it kills xemu before RomM pulls
+        and a live-QMP requirement stranded every exit save inside the container."""
+        live = _qmp_available()
+        if live:
+            queried = _qmp_snapshot_tags()
+            if queried is None:
+                self._send_json(503, {"error": "could not query xemu for saved states"})
+                return
+            open_image, tags = queried
+            # The snapshots were read off the image xemu has open; zipping
+            # HDD_IMAGE when hdd_path points somewhere else would serve an
+            # archive that does not contain the capture, and a wrong archive is
+            # worse than an error.
+            if not _same_image(open_image, HDD_IMAGE):
+                log.error("state-file: xemu has %s open but the broker serves %s — refusing",
+                          open_image or "<unknown>", HDD_IMAGE)
+                self._send_json(500, {
+                    "error": "xemu has a different hard disk image open than the broker serves",
+                    "xemu_image": open_image,
+                    "broker_image": str(HDD_IMAGE),
+                })
+                return
+        else:
+            # Read from the very image that is about to be zipped, so a hit here
+            # already proves the archive carries the capture. That is what
+            # _same_image buys on the live path, where the tags come from xemu.
+            tags = _qcow2_snapshot_tags(HDD_IMAGE)
+            if tags is None:
+                self._send_json(
+                    503, {"error": "could not read saved states from the disk image"}
+                )
+                return
         if f"broker-slot-{slot}" not in tags:
             self._send_json(404, {"error": "no state for slot", "slot": slot})
             return
@@ -1039,25 +1268,36 @@ class BrokerHandler(BaseHTTPRequestHandler):
         with _lock:
             rom_name = _state["rom_name"]
 
-        if not _qmp_pause():
+        still_paused = False
+        if not live:
+            content = _zip_hdd_image()
+            # A /launch slipping through would put xemu back on the image
+            # mid-zip, and half of that archive predates the reopen.
+            if _qmp_available():
+                log.error("state-file: xemu started while slot %d was being read", slot)
+                self._send_json(
+                    409, {"error": "xemu started while the disk image was being read"}
+                )
+                return
+        elif not _qmp_pause():
             self._send_json(503, {"error": "could not pause xemu to read the disk image"})
             return
-        try:
-            content = _zip_hdd_image()
-        finally:
-            still_paused = False
-            if not _qmp_resume():
-                # A DELETE /launch can kill xemu mid-read, and a dead process
-                # cannot be "stuck paused" — only report that for one that is
-                # still there.
-                if _qmp_available():
-                    # The guest is stuck paused and the session is unusable until
-                    # it is stopped, so the caller is told rather than served a
-                    # bare 200.
-                    still_paused = True
-                    log.error("state-file: xemu stayed paused after reading slot %d", slot)
-                else:
-                    log.info("state-file: xemu was stopped while reading slot %d", slot)
+        else:
+            try:
+                content = _zip_hdd_image()
+            finally:
+                if not _qmp_resume():
+                    # A DELETE /launch can kill xemu mid-read, and a dead process
+                    # cannot be "stuck paused" — only report that for one that is
+                    # still there.
+                    if _qmp_available():
+                        # The guest is stuck paused and the session is unusable
+                        # until it is stopped, so the caller is told rather than
+                        # served a bare 200.
+                        still_paused = True
+                        log.error("state-file: xemu stayed paused after reading slot %d", slot)
+                    else:
+                        log.info("state-file: xemu was stopped while reading slot %d", slot)
 
         if content is None:
             self._send_json(500, {"error": "could not read the hard disk image"})
@@ -1122,8 +1362,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if urlparse(self.path).path == "/state-file":
+        path = urlparse(self.path).path
+        if path == "/state-file":
             self._get_state_file()
+            return
+
+        if path == "/state-screenshot":
+            self._get_state_screenshot()
             return
 
         self._send_json(404, {"error": "not found"})

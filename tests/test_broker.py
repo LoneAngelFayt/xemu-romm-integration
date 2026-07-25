@@ -9,6 +9,7 @@ import io
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -971,11 +973,6 @@ def test_same_image_matches_through_a_symlink(tmp_path):
     assert broker._same_image(str(tmp_path / "other.qcow2"), real) is False
 
 
-def test_get_state_file_409_when_xemu_down(state_client, monkeypatch):
-    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
-    assert _raw_req(state_client, "GET", "/state-file?slot=3")[0] == 409
-
-
 def test_get_state_file_503_when_pause_fails(state_client, monkeypatch):
     monkeypatch.setattr(broker, "_qmp_pause", lambda: False)
     assert _raw_req(state_client, "GET", "/state-file?slot=3")[0] == 503
@@ -1254,6 +1251,317 @@ def test_get_state_file_413_without_zipping_an_oversized_image(state_client, hdd
     assert json.loads(body)["error"] == "state file exceeds size limit"
     assert zipped == []  # no compressed copy was ever built
     assert paused == []  # and the guest was never stopped for it
+    with broker._lock:
+        assert broker._state["state_file_in_progress"] is False
+
+
+# ── qcow2 snapshot table ──────────────────────────────────────────────────────
+
+
+def _qcow2(path: Path, tags, *, nb_override=None, truncate=0):
+    """Write a qcow2 whose snapshot table holds `tags`.
+
+    Only the fields _qcow2_snapshot_tags reads are filled in; the rest of the
+    header is zeroes, which is enough because nothing here opens the image.
+    """
+    entries = b""
+    for i, tag in enumerate(tags):
+        name = tag.encode()
+        id_str = str(i + 1).encode()
+        extra = b""
+        entries += struct.pack(
+            ">QIHHIIQII", 0, 0, len(id_str), len(name), 0, 0, 0, 0, len(extra)
+        )
+        entries += extra + id_str + name
+        entries += b"\x00" * (-(len(extra) + len(id_str) + len(name)) % 8)
+
+    table_offset = 512
+    header = bytearray(b"\x00" * table_offset)
+    header[0:4] = b"QFI\xfb"
+    header[4:8] = (3).to_bytes(4, "big")
+    count = len(tags) if nb_override is None else nb_override
+    header[60:64] = count.to_bytes(4, "big")
+    header[64:72] = table_offset.to_bytes(8, "big")
+    blob = bytes(header) + entries
+    path.write_bytes(blob[:len(blob) - truncate] if truncate else blob)
+    return path
+
+
+def test_qcow2_snapshot_tags_reads_the_table(tmp_path):
+    """Names of differing length exercise the 8-byte padding between entries."""
+    img = _qcow2(tmp_path / "d.qcow2", ["broker-slot-1", "broker-slot-10", "manual"])
+    assert broker._qcow2_snapshot_tags(img) == {
+        "broker-slot-1", "broker-slot-10", "manual",
+    }
+
+
+def test_qcow2_snapshot_tags_empty_table_is_not_a_failure(tmp_path):
+    """An empty set means "no states"; None means "could not tell" — the caller
+    turns the second into a 503, so they must not be conflated."""
+    assert broker._qcow2_snapshot_tags(_qcow2(tmp_path / "d.qcow2", [])) == set()
+
+
+def test_qcow2_snapshot_tags_rejects_a_non_qcow2(tmp_path):
+    path = tmp_path / "d.qcow2"
+    path.write_bytes(b"not an image at all, but long enough to read 72 bytes......")
+    assert broker._qcow2_snapshot_tags(path) is None
+
+
+def test_qcow2_snapshot_tags_none_on_missing_file(tmp_path):
+    assert broker._qcow2_snapshot_tags(tmp_path / "gone.qcow2") is None
+
+
+def test_qcow2_snapshot_tags_none_on_truncated_table(tmp_path):
+    """A half-written table must not read as a shorter list of states."""
+    img = _qcow2(tmp_path / "d.qcow2", ["broker-slot-1", "broker-slot-2"], truncate=12)
+    assert broker._qcow2_snapshot_tags(img) is None
+
+
+def test_qcow2_snapshot_tags_none_when_count_overruns_the_file(tmp_path):
+    img = _qcow2(tmp_path / "d.qcow2", ["broker-slot-1"], nb_override=5)
+    assert broker._qcow2_snapshot_tags(img) is None
+
+
+# ── State frames ──────────────────────────────────────────────────────────────
+
+
+def _ppm(width, height, pixels, maxval=255, comment=b""):
+    return b"P6\n" + comment + b"%d %d\n%d\n" % (width, height, maxval) + pixels
+
+
+def _png_parts(png):
+    """Split a PNG into (width, height, raw scanline bytes)."""
+    assert png[:8] == broker._PNG_MAGIC
+    pos, chunks = 8, {}
+    while pos < len(png):
+        size = int.from_bytes(png[pos:pos + 4], "big")
+        kind = png[pos + 4:pos + 8]
+        data = png[pos + 8:pos + 8 + size]
+        assert zlib.crc32(kind + data) == int.from_bytes(
+            png[pos + 8 + size:pos + 12 + size], "big"
+        ), f"{kind!r} chunk CRC is wrong"
+        chunks.setdefault(kind, b"")
+        chunks[kind] += data
+        pos += 12 + size
+    assert b"IEND" in chunks
+    width, height, depth, colour = struct.unpack(">IIBB", chunks[b"IHDR"][:10])
+    assert (depth, colour) == (8, 2)  # 8-bit truecolor
+    return width, height, zlib.decompress(chunks[b"IDAT"])
+
+
+def test_ppm_to_png_round_trips_pixels():
+    pixels = bytes(range(18))  # 3x2 RGB
+    width, height, raw = _png_parts(broker._ppm_to_png(_ppm(3, 2, pixels)))
+    assert (width, height) == (3, 2)
+    # Every scanline carries a leading filter byte of 0.
+    assert raw == b"\x00" + pixels[:9] + b"\x00" + pixels[9:]
+
+
+def test_ppm_to_png_skips_header_comments():
+    """xemu writes no comment, but the PPM grammar allows one anywhere."""
+    png = broker._ppm_to_png(_ppm(1, 1, b"\x01\x02\x03", comment=b"# xemu\n"))
+    assert _png_parts(png) == (1, 1, b"\x00\x01\x02\x03")
+
+
+def test_ppm_to_png_rejects_a_non_ppm():
+    assert broker._ppm_to_png(b"\x89PNG\r\n\x1a\nalready a png") is None
+
+
+def test_ppm_to_png_rejects_16_bit_samples():
+    assert broker._ppm_to_png(_ppm(1, 1, b"\x00" * 6, maxval=65535)) is None
+
+
+def test_ppm_to_png_rejects_short_pixel_data():
+    """A truncated capture would otherwise become a PNG of garbage."""
+    assert broker._ppm_to_png(_ppm(4, 4, b"\x00" * 12)) is None
+
+
+def test_ppm_to_png_rejects_a_truncated_header():
+    assert broker._ppm_to_png(b"P6\n64 ") is None
+
+
+@pytest.fixture
+def shots(tmp_path, monkeypatch):
+    monkeypatch.setattr(broker, "STATE_SHOT_DIR", tmp_path / "shots")
+    return tmp_path / "shots"
+
+
+def test_capture_state_shot_writes_a_png(shots, monkeypatch):
+    def _screendump(cmd, args):
+        assert cmd == "screendump"
+        Path(args["filename"]).write_bytes(_ppm(1, 1, b"\xff\x00\x00"))
+        return {}
+
+    monkeypatch.setattr(broker, "_qmp_command", _screendump)
+    assert broker._capture_state_shot(4) is True
+    assert (shots / "state-slot-4.png").read_bytes()[:8] == broker._PNG_MAGIC
+
+
+def test_capture_state_shot_removes_its_temp_ppm(shots, monkeypatch):
+    dumps = []
+
+    def _screendump(cmd, args):
+        dumps.append(Path(args["filename"]))
+        dumps[-1].write_bytes(_ppm(1, 1, b"\x00\x00\x00"))
+        return {}
+
+    monkeypatch.setattr(broker, "_qmp_command", _screendump)
+    broker._capture_state_shot(4)
+    assert dumps and not dumps[0].exists()
+
+
+def test_capture_state_shot_false_when_qmp_fails(shots, monkeypatch):
+    monkeypatch.setattr(
+        broker, "_qmp_command", lambda c, a: (_ for _ in ()).throw(OSError("no socket"))
+    )
+    assert broker._capture_state_shot(4) is False
+    assert not (shots / "state-slot-4.png").exists()
+
+
+def test_save_state_replaces_the_frame(shots, monkeypatch):
+    """The capture belongs to the save that just happened, not the one before."""
+    shots.mkdir()
+    (shots / "state-slot-2.png").write_bytes(b"stale")
+    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: True)
+    monkeypatch.setattr(broker, "_capture_state_shot", lambda s: shots.joinpath(
+        f"state-slot-{s}.png").write_bytes(b"fresh") or True)
+    assert broker._qmp_save_state(2) is True
+    assert (shots / "state-slot-2.png").read_bytes() == b"fresh"
+
+
+def test_save_state_drops_a_stale_frame_when_capture_fails(shots, monkeypatch):
+    """Better no thumbnail than the previous save's picture on the new state."""
+    shots.mkdir()
+    (shots / "state-slot-2.png").write_bytes(b"stale")
+    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: True)
+    monkeypatch.setattr(broker, "_capture_state_shot", lambda s: False)
+    assert broker._qmp_save_state(2) is True
+    assert not (shots / "state-slot-2.png").exists()
+
+
+def test_failed_save_leaves_the_frame_alone(shots, monkeypatch):
+    """The old snapshot survives a failed save, so its frame must too."""
+    shots.mkdir()
+    (shots / "state-slot-2.png").write_bytes(b"previous")
+    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: cmd != "snapshot-save")
+    monkeypatch.setattr(
+        broker, "_capture_state_shot", lambda s: pytest.fail("no save, no capture")
+    )
+    assert broker._qmp_save_state(2) is False
+    assert (shots / "state-slot-2.png").read_bytes() == b"previous"
+
+
+def test_restore_clears_every_frame(shots, hdd):
+    """The frames picture snapshots in the image the restore just overwrote."""
+    shots.mkdir()
+    for slot in (1, 7):
+        (shots / f"state-slot-{slot}.png").write_bytes(b"old session")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(broker.HDD_IMAGE_ENTRY, b"restored image")
+    assert broker._restore_hdd_image(buf.getvalue()) is None
+    assert list(shots.glob("state-slot-*.png")) == []
+
+
+def test_failed_restore_keeps_the_frames(shots, hdd):
+    """The disk was not replaced, so the frames still match it."""
+    shots.mkdir()
+    (shots / "state-slot-1.png").write_bytes(b"current")
+    assert broker._restore_hdd_image(b"not a zip") is not None
+    assert (shots / "state-slot-1.png").read_bytes() == b"current"
+
+
+# ── GET /state-screenshot ─────────────────────────────────────────────────────
+
+
+def test_get_state_screenshot_serves_the_frame(client, shots):
+    shots.mkdir()
+    (shots / "state-slot-6.png").write_bytes(broker._PNG_MAGIC + b"body")
+    code, headers, body = _raw_req(client, "GET", "/state-screenshot?slot=6")
+    assert code == 200
+    assert headers["Content-Type"] == "image/png"
+    assert body == broker._PNG_MAGIC + b"body"
+
+
+def test_get_state_screenshot_404_when_no_frame(client, shots):
+    """RomM treats the 404 as "this broker keeps no frames" and moves on."""
+    assert _raw_req(client, "GET", "/state-screenshot?slot=6")[0] == 404
+
+
+def test_get_state_screenshot_rejects_bad_slot(client, shots):
+    assert _raw_req(client, "GET", "/state-screenshot?slot=abc")[0] == 400
+    assert _raw_req(client, "GET", "/state-screenshot?slot=99")[0] == 400
+
+
+def test_get_state_screenshot_works_with_xemu_down(client, shots, monkeypatch):
+    """The whole point: /save-and-exit has killed xemu by the time RomM asks."""
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    shots.mkdir()
+    (shots / "state-slot-6.png").write_bytes(broker._PNG_MAGIC)
+    assert _raw_req(client, "GET", "/state-screenshot?slot=6")[0] == 200
+
+
+# ── GET /state-file with xemu down ────────────────────────────────────────────
+
+
+@pytest.fixture
+def offline_client(client, tmp_path, monkeypatch):
+    """xemu gone and a real qcow2 on disk, which is the /save-and-exit aftermath."""
+    path = tmp_path / "xemu" / "xbox_hdd.qcow2"
+    path.parent.mkdir(parents=True)
+    _qcow2(path, ["broker-slot-3"])
+    monkeypatch.setattr(broker, "HDD_IMAGE", path)
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    monkeypatch.setattr(broker, "STATE_GET_WAIT", 0.3)
+    monkeypatch.setattr(
+        broker, "_qmp_snapshot_tags", lambda: pytest.fail("xemu is down; do not ask it")
+    )
+    return client
+
+
+def test_get_state_file_serves_an_exit_save(offline_client):
+    """save-and-exit kills xemu before RomM pulls, so requiring live QMP here
+    stranded every exit save inside the container."""
+    code, headers, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 200
+    assert headers["Content-Type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(body)) as zf:
+        assert zf.read(broker.HDD_IMAGE_ENTRY)[:4] == b"QFI\xfb"
+
+
+def test_get_state_file_offline_does_not_pause(offline_client, monkeypatch):
+    """There is no guest to stop, and pausing a dead xemu would fail the read."""
+    monkeypatch.setattr(broker, "_qmp_pause", lambda: pytest.fail("nothing to pause"))
+    monkeypatch.setattr(broker, "_qmp_resume", lambda: pytest.fail("nothing to resume"))
+    code, headers, _ = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 200
+    assert "X-Xemu-Paused" not in headers
+
+
+def test_get_state_file_offline_404_when_slot_empty(offline_client):
+    code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=5")
+    assert code == 404
+    assert json.loads(body)["error"] == "no state for slot"
+
+
+def test_get_state_file_offline_503_when_the_image_is_unreadable(offline_client):
+    """An unparseable image must not read as "this slot is empty" — that would
+    tell RomM the save vanished when the truth is the broker cannot tell."""
+    broker.HDD_IMAGE.write_bytes(b"shredded" * 16)
+    code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 503
+    assert json.loads(body)["error"] == "could not read saved states from the disk image"
+
+
+def test_get_state_file_409_when_xemu_restarts_mid_read(offline_client, monkeypatch):
+    """A /launch landing during the zip reopens the image, so half the archive
+    predates the reopen and the whole thing is untrustworthy."""
+    monkeypatch.setattr(broker, "_zip_hdd_image", lambda: (
+        monkeypatch.setattr(broker, "_qmp_available", lambda: True), b"PK\x03\x04"
+    )[1])
+    code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 409
+    assert "started" in json.loads(body)["error"]
     with broker._lock:
         assert broker._state["state_file_in_progress"] is False
 
