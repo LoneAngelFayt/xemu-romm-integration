@@ -51,7 +51,7 @@ if ! command -v python3 &>/dev/null; then
     command -v python3 &>/dev/null || _have_python=0
 fi
 if [ "$_have_python" = "0" ]; then
-    echo "[xemu-broker-mod] ERROR: python3 is NOT on PATH after the install attempt — the RomM broker will not start, the xemu.toml seed (gamepad driver + Vulkan renderer pin) will be skipped and the per-container Xbox hard disk image will not be copied."
+    echo "[xemu-broker-mod] ERROR: python3 is NOT on PATH after the install attempt — the RomM broker will not start, the xemu.toml seed (gamepad driver, fullscreen, Vulkan renderer pin) will be skipped and the per-container Xbox hard disk image will not be copied."
 fi
 
 # ── Disable boot-time xemu in the desktop autostart ──────────────────────────
@@ -73,10 +73,16 @@ done
 
 # ── Seed xemu.toml defaults ──────────────────────────────────────────────────
 # xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.
-# We seed two things:
+# We seed three things:
 #   [input.bindings]   port1_driver = 'usb-xbox-gamepad'  — always, so a
 #                      fresh container presents port 1 as an SDL gamepad
 #                      without requiring manual UI setup.
+#   [display.window]   fullscreen_on_startup = true       — always. xemu's
+#                      window otherwise opens at its own default size in the
+#                      corner of the streamed canvas, so the player sees the
+#                      game in a small box with the rest of the frame black.
+#                      The key only exists under [display.window]; xemu drops
+#                      it from a plain [display] table.
 #   [display]          renderer = 'VULKAN'                 — only on AMD GPUs.
 #                      xemu's OpenGL path asserts in gl_fence after an amdgpu
 #                      ring-timeout reset on Renoir/Mesa, so pin Vulkan, which
@@ -111,7 +117,7 @@ else
 fi
 
 if [ "$_have_python" = "0" ]; then
-    echo "[xemu-broker-mod] ERROR: skipping xemu.toml seed (port1_driver, renderer pin) — python3 is missing."
+    echo "[xemu-broker-mod] ERROR: skipping xemu.toml seed (port1_driver, fullscreen, renderer pin) — python3 is missing."
 else
 python3 - "$XEMU_CONFIG" "$_amd_gpu" <<'PYEOF'
 import sys, re
@@ -153,6 +159,10 @@ if amd_gpu:
     else:
         text, _ = _seed(text, '[display]', 'renderer', "'VULKAN'")
         print("[xemu-broker-mod] Seeded [display] renderer = 'VULKAN'.")
+
+text, did = _seed(text, '[display.window]', 'fullscreen_on_startup', 'true')
+if did:
+    print('[xemu-broker-mod] Seeded [display.window] fullscreen_on_startup = true.')
 
 p.write_text(text)
 PYEOF

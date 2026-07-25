@@ -21,6 +21,7 @@ Save states are stored as named snapshots inside the HDD image. The HDD image mu
 - Save state support — 9 user slots + 1 autosave slot (slot 10), stored inside the Xbox HDD image
 - Volume and mute control via PulseAudio
 - Controller support via the selkies joystick interposer (gamepad auto-configured on port 1)
+- Fills the stream — seeds `fullscreen_on_startup` so xemu's window covers the streamed canvas instead of sitting in a corner of it
 - AMD GPU support — pins the Vulkan renderer in `xemu.toml`, since xemu's OpenGL path hangs the GPU here
 - Save states importable into the RomM library, and resumable on any container
 - Per-container Xbox hard disk image, so players never share save data
@@ -251,6 +252,7 @@ The broker owns the xemu process. The desktop autostart is neutered at startup s
 Startup (init.sh)
   └── Write broker-managed autostart (labwc + openbox): no boot-time xemu
   └── Seed xemu.toml: port1_driver = 'usb-xbox-gamepad'
+  └── Seed fullscreen_on_startup = true: else xemu draws in a corner of the stream
   └── Pin renderer = 'VULKAN' (AMD GPUs): xemu's OpenGL path hangs the GPU
   └── Copy the stock Xbox HDD image to /config/xemu and repoint hdd_path
   └── chown xemu config dir to abc
