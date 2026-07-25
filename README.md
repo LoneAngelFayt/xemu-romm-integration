@@ -17,7 +17,7 @@ Save states are stored as named snapshots inside the HDD image. The HDD image mu
 ## Features
 
 - Launch Xbox ROMs on demand from RomM (XISO `.iso` format)
-- Return to the Xbox dashboard when a session ends
+- Stop xemu when a session ends, so no gameless instance burns CPU at the dashboard
 - Save state support — 9 user slots + 1 autosave slot (slot 10), stored inside the Xbox HDD image
 - Volume and mute control via PulseAudio
 - Controller support via the selkies joystick interposer (gamepad auto-configured on port 1)
@@ -78,7 +78,7 @@ services:
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
 | `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state archive in either direction |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
-| `STOP_WAIT` | `5.0` | Max seconds `DELETE /launch` waits for an in-flight `/state-file` transfer before stopping xemu anyway |
+| `STOP_WAIT` | `5.0` | Max seconds `DELETE /launch` waits for an in-flight `/state-file` transfer or snapshot job before stopping xemu anyway |
 | `BROKER_REQUEST_TIMEOUT` | `60.0` | Per-socket HTTP request timeout; a client that stalls mid-request is dropped rather than holding a handler thread |
 
 ## Broker API
@@ -102,10 +102,15 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
   "rom_path": "/romm/library/roms/xbox/Fable.xiso.iso",
   "rom_name": "Fable",
   "started_at": "2026-04-25T11:50:00Z",
-  "launch_error": null
+  "launch_error": null,
+  "resume_error": null
 }
 ```
-`active` is true only when xemu is reachable via QMP **and** a ROM has been loaded. `setup` is true only when xemu is up for a `/setup` configuration session with no ROM loaded, so `active` and `setup` are never both true. `launch_error` is `null` on success; after a failed `/launch` it holds the reason (QMP never came up, or the ROM could not be loaded) so the frontend can show why the game never started. It clears at the start of the next launch.
+`active` is true only when xemu is reachable via QMP **and** a ROM has been loaded. `setup` is true only when xemu is up for a `/setup` configuration session with no ROM loaded, so `active` and `setup` are never both true.
+
+`launch_error` is `null` on success; after a failed `/launch` it holds the reason (QMP never came up, or the ROM could not be loaded) so the frontend can show why the game never started. When it is set there is no session — `active` is false.
+
+`resume_error` is the opposite case: the ROM did launch, but the `load_slot` it was asked to resume from held no usable state, so the game booted fresh. `active` stays true and `launch_error` stays `null`, so this is the only field telling the frontend the player is not where they left off. Both clear at the start of the next launch and when a session ends via `DELETE /launch` or `/save-and-exit`.
 
 ### Write
 
@@ -116,7 +121,7 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 | `/launch` | DELETE | — | End the active game or setup session and stop xemu |
 | `/state-file?filename=<name>.xNN` | PUT | Zipped hard disk image | Restore a state pulled from RomM. Rejected while xemu is running |
 | `/cleanup` | POST | — | Restart selkies to flush stale gamepad sockets |
-| `/save-and-exit` | POST | — | Save to autosave slot (10) and stop xemu |
+| `/save-and-exit` | POST | `{"slot": 0–10, "wait": true\|false}` | Save (slot defaults to 10, the autosave slot) and stop xemu |
 | `/save-state` | POST | `{"slot": 1–10}` | Save state to the given slot |
 | `/load-state` | POST | `{"slot": 1–10}` | Load state from the given slot |
 | `/volume` | POST | `{"level": 0–100}` | Set PulseAudio sink volume |
@@ -139,11 +144,15 @@ Returns `409` if a game session is active or a launch is in progress, and `200 {
 
 #### `/launch` (DELETE)
 
-Ejects the disc (`eject` QMP command) and resets the console, sending xemu back to the Xbox dashboard. Clears broker session state, ending an active game **or** a `/setup` session.
+Kills the xemu process and clears broker session state, ending an active game **or** a `/setup` session. xemu is stopped rather than returned to the dashboard because a gameless instance busy-loops several CPU cores under software rendering.
+
+An in-flight `/state-file` transfer or snapshot job gets up to `STOP_WAIT` seconds to finish first — the transfer holds the guest paused mid-read, and a save is a snapshot job a `SIGTERM` would cut in half. The stop still wins once that window runs out, since it is the only way out of a hung session.
 
 #### `/save-and-exit` (POST)
 
-Saves to slot 10 (autosave) via QMP, then ejects the disc and resets to dashboard. The save runs synchronously before the reset — if the save fails, the reset still happens and a warning is logged.
+Body: `{"slot": 0–10, "wait": true|false}`. Both are optional — `slot` defaults to 10 (autosave) and `0` is a legacy value remapped to 10; `wait` defaults to `true`.
+
+Saves to the slot via QMP, then kills xemu. With `wait: true` the save runs synchronously and the response carries `{"status": "ok", "saved": <bool>, "slot": N}`; with `wait: false` it is queued on a background thread and the response is `{"status": "queued", "slot": N}`. If the save fails, xemu is stopped anyway and a warning is logged.
 
 #### `/save-state` (POST)
 
@@ -193,7 +202,7 @@ Broker (broker.py, port 8000)
   └── POST /launch     → spawn xemu -qmp … → blockdev-change-medium + system_reset
   │                      (optional load_slot resumes a snapshot after the disc is in)
   └── POST /setup      → spawn xemu -qmp … at the dashboard (no disc), auto-stop after SETUP_TIMEOUT
-  └── DELETE /launch   → kill xemu, back to the dashboard (ends a game or setup session)
+  └── DELETE /launch   → kill xemu (ends a game or setup session)
   └── GET  /state-file → QMP stop → zip xbox_hdd.qcow2 → cont
   └── PUT  /state-file → restore a zipped image (only while xemu is stopped)
   └── POST /save-state → snapshot-delete (stale) + snapshot-save (async job)
