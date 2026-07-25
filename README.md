@@ -124,6 +124,7 @@ services:
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
 | `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state **archive** in either direction |
 | `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs past 256MB while zipping to under 50MB, and a qcow2 never shrinks when a snapshot is deleted |
+| `STATE_TRIM` | `1` | Rebuild the image around the one snapshot being served so the other slots do not ship inside the archive. `0` serves the whole image, which is also where any failed or refused rebuild falls back to |
 | `PIXELFLUX_CU` | `8085` | Container-internal port of the pixelflux Computer Use server that state thumbnails are captured from. `0` disables it. **Never publish this port** — see [State thumbnails](#state-thumbnails) |
 | `STATE_SHOT_TIMEOUT` | `10.0` | Seconds to wait for a captured frame before giving up and saving without one |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
@@ -230,7 +231,13 @@ Slot 10 is reserved for the autosave triggered by `/save-and-exit`. Slots 1–9 
 
 ### Import and resume
 
-A QMP snapshot cannot be exported on its own, so the portable artifact is the whole hard disk image, zipped. After a save, RomM calls `GET /state-file?slot=N`, which pauses the vCPUs (so the qcow2 is not read mid-write), zips the image, resumes, and returns it as `<rom>.xNN`. The archive is small in practice — a fresh image with several snapshots compresses to well under a megabyte.
+A QMP snapshot cannot be exported on its own, so the portable artifact is the hard disk image, zipped. After a save, RomM calls `GET /state-file?slot=N`, which pauses the vCPUs (so the qcow2 is not read mid-write), zips the image, resumes, and returns it as `<rom>.xNN`.
+
+Because every slot lives in that one image, shipping it whole would put slots 1–4 inside the archive for slot 5, and archives would grow with every save. So the image is first rebuilt around the snapshot being served: the active disk and that one snapshot are copied into a fresh qcow2 and the rest is left behind, along with any clusters an interrupted snapshot job leaked. Archive size then depends on the state being saved rather than on how many saves came before it — on a real image with two slots this took the archive from 83MB to 53MB, and the second number no longer climbs.
+
+The rebuilt image is checked before it is used: the guest-visible bytes of both surviving mappings are compared against the original cluster by cluster, and the refcounts are recomputed from the tables. Anything short of an exact match, an image the rebuild does not understand (compressed clusters, a backing file, encryption), or `STATE_TRIM=0` all fall back to serving the untouched image, so this can only ever cost archive size, never a save.
+
+A restored state therefore contains only its own snapshot. Loading slot 5 no longer brings slots 1–4 back with it — RomM is the store of record for state history, not the image.
 
 To resume, RomM pushes the archive back with `PUT /state-file?filename=<rom>.xNN` while xemu is stopped (the call returns `409` otherwise), then launches with `{"rom_path": "...", "load_slot": N}`. The broker inserts the disc first and loads the snapshot after, so the restored machine is already running that disc.
 

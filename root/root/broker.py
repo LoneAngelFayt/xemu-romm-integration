@@ -55,6 +55,12 @@ STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024
 HDD_IMAGE_MAX_BYTES = int(os.environ.get("HDD_IMAGE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
+# A state archive carries only the snapshot it is for. xemu keeps every slot in
+# one qcow2 and cannot export a snapshot on its own, so without this slot 5
+# ships slots 1-4 inside it and archives grow with every save. Set to 0 to serve
+# the whole image, which is also where every failure in the rebuild lands.
+STATE_TRIM = os.environ.get("STATE_TRIM", "1").strip().lower() not in {"0", "false", "no"}
+
 # Captured state frames sit beside the disk image so they outlive xemu: RomM
 # asks for the frame during the pull, by which time /save-and-exit has already
 # killed the process that could have drawn it.
@@ -526,6 +532,437 @@ def _qcow2_snapshot_tags(path: Path) -> set | None:
         return None
 
 
+# ── Trimming a state archive to one snapshot ──────────────────────────────────
+#
+# The archive used to be the whole disk image, which meant slot 5 shipped every
+# earlier slot's VM state inside it and archives grew with each save. Rebuilding
+# the image around the one snapshot being served leaves the others behind, and
+# leaves behind clusters an interrupted snapshot job leaked as well, because the
+# rebuild copies only what the two surviving mappings actually reach.
+
+_QCOW2_OFFSET_MASK = 0x00FFFFFFFFFFFE00
+_QCOW2_FLAG_COPIED = 1 << 63
+_QCOW2_FLAG_COMPRESSED = 1 << 62
+
+
+class _Qcow2Error(Exception):
+    """This image is not one the rebuild is prepared to touch.
+
+    Always caught: the caller then serves the untouched image, so refusing here
+    costs archive size and never a save."""
+
+
+def _ceil_div(n: int, by: int) -> int:
+    return -(-n // by)
+
+
+def _qcow2_read_at(fh, offset: int, size: int) -> bytes:
+    """Read exactly `size` bytes; a short read means a truncated image."""
+    if offset < 0 or size < 0:
+        raise _Qcow2Error(f"nonsense read of {size} bytes at {offset}")
+    fh.seek(offset)
+    data = fh.read(size)
+    if len(data) != size:
+        raise _Qcow2Error(f"image ends inside a {size}-byte read at {offset}")
+    return data
+
+
+def _qcow2_parse_header(fh) -> dict:
+    head = _qcow2_read_at(fh, 0, 72)
+    if head[:4] != _QCOW2_MAGIC:
+        raise _Qcow2Error("not a qcow2")
+    version = int.from_bytes(head[4:8], "big")
+    if version not in (2, 3):
+        raise _Qcow2Error(f"qcow2 version {version}")
+    if int.from_bytes(head[8:16], "big"):
+        raise _Qcow2Error("backing files are not supported")
+    cluster_bits = int.from_bytes(head[20:24], "big")
+    if not 9 <= cluster_bits <= 21:
+        raise _Qcow2Error(f"implausible cluster_bits {cluster_bits}")
+    if int.from_bytes(head[32:36], "big"):
+        raise _Qcow2Error("encrypted images are not supported")
+    refcount_order = 4
+    if version >= 3:
+        # An external data file, extended L2 entries, a non-zlib compression
+        # type or a corrupt marker all change what the tables below mean, so
+        # none of them are guessed at.
+        if int.from_bytes(_qcow2_read_at(fh, 72, 8), "big"):
+            raise _Qcow2Error("image sets incompatible feature bits")
+        refcount_order = int.from_bytes(_qcow2_read_at(fh, 96, 4), "big")
+    if refcount_order != 4:
+        raise _Qcow2Error(f"refcount_order {refcount_order} is not supported")
+    return {
+        "version": version,
+        "cluster_bits": cluster_bits,
+        "cluster": 1 << cluster_bits,
+        "size": int.from_bytes(head[24:32], "big"),
+        "l1_size": int.from_bytes(head[36:40], "big"),
+        "l1_offset": int.from_bytes(head[40:48], "big"),
+        "rc_offset": int.from_bytes(head[48:56], "big"),
+        "rc_clusters": int.from_bytes(head[56:60], "big"),
+        "nb_snapshots": int.from_bytes(head[60:64], "big"),
+        "snapshots_offset": int.from_bytes(head[64:72], "big"),
+    }
+
+
+def _qcow2_read_snapshot_table(fh, hdr: dict) -> list:
+    """Every snapshot entry, keeping raw bytes so one can be written back."""
+    out = []
+    pos = hdr["snapshots_offset"]
+    for _ in range(hdr["nb_snapshots"]):
+        entry = _qcow2_read_at(fh, pos, 40)
+        (l1_offset, l1_size, id_len, name_len, _sec, _nsec, _clock,
+         vm_state_size, extra_len) = struct.unpack(_QCOW2_SNAPSHOT_ENTRY, entry)
+        body = _qcow2_read_at(fh, pos + 40, extra_len + id_len + name_len)
+        pad = -len(body) % 8
+        _qcow2_read_at(fh, pos + 40 + len(body), pad)
+        out.append({
+            "name": body[extra_len + id_len:].decode("utf-8", "replace"),
+            "l1_offset": l1_offset,
+            "l1_size": l1_size,
+            "vm_state_size": vm_state_size,
+            "raw": entry + body + b"\x00" * pad,
+        })
+        pos += 40 + len(body) + pad
+    return out
+
+
+def _qcow2_read_l1(fh, offset: int, size: int) -> tuple:
+    if not size:
+        return ()
+    return struct.unpack(f">{size}Q", _qcow2_read_at(fh, offset, size * 8))
+
+
+def _qcow2_mapping(fh, hdr: dict, l1_offset: int, l1_size: int) -> dict:
+    """Guest cluster index to host offset, for every allocated cluster."""
+    cluster = hdr["cluster"]
+    per_l2 = cluster // 8
+    mapping = {}
+    for i, entry in enumerate(_qcow2_read_l1(fh, l1_offset, l1_size)):
+        l2_offset = entry & _QCOW2_OFFSET_MASK
+        if not l2_offset:
+            continue
+        l2 = struct.unpack(f">{per_l2}Q", _qcow2_read_at(fh, l2_offset, cluster))
+        for j, l2e in enumerate(l2):
+            if l2e & _QCOW2_FLAG_COMPRESSED:
+                raise _Qcow2Error("compressed clusters are not supported")
+            host = l2e & _QCOW2_OFFSET_MASK
+            if host:
+                mapping[i * per_l2 + j] = host
+    return mapping
+
+
+def _qcow2_rebuild(src: Path, dst: Path, keep: str) -> dict:
+    """Write dst holding the active disk and only the snapshot named `keep`.
+
+    Sharing is preserved: an L2 table or data cluster both mappings point at is
+    written once and pointed at twice, so a snapshot that has barely diverged
+    from the live disk stays as cheap as it is in the source image."""
+    with src.open("rb") as fh:
+        hdr = _qcow2_parse_header(fh)
+        cluster = hdr["cluster"]
+        per_l2 = cluster // 8
+
+        snapshots = _qcow2_read_snapshot_table(fh, hdr)
+        matches = [s for s in snapshots if s["name"] == keep]
+        if len(matches) != 1:
+            raise _Qcow2Error(
+                f"{keep!r} names {len(matches)} snapshots, expected exactly one")
+        kept = matches[0]
+
+        active_l1 = _qcow2_read_l1(fh, hdr["l1_offset"], hdr["l1_size"])
+        snap_l1 = _qcow2_read_l1(fh, kept["l1_offset"], kept["l1_size"])
+
+        l2_order, l2_at = [], {}
+        for entries in (active_l1, snap_l1):
+            for entry in entries:
+                offset = entry & _QCOW2_OFFSET_MASK
+                if offset and offset not in l2_at:
+                    l2_at[offset] = len(l2_order)
+                    l2_order.append(offset)
+
+        l2_body, data_order, data_at = {}, [], {}
+        for offset in l2_order:
+            entries = struct.unpack(f">{per_l2}Q", _qcow2_read_at(fh, offset, cluster))
+            l2_body[offset] = entries
+            for l2e in entries:
+                if l2e & _QCOW2_FLAG_COMPRESSED:
+                    raise _Qcow2Error("compressed clusters are not supported")
+                host = l2e & _QCOW2_OFFSET_MASK
+                if host and host not in data_at:
+                    data_at[host] = len(data_order)
+                    data_order.append(host)
+
+        # An L2 table counts once per L1 entry reaching it, and a data cluster
+        # once per L2 entry times the refcount of the table that entry sits in.
+        # That last factor is how QEMU counts a snapshot sharing a table with
+        # the active disk, and getting it wrong makes QEMU write in place over a
+        # cluster the snapshot still needs.
+        l2_refs = dict.fromkeys(l2_order, 0)
+        for entries in (active_l1, snap_l1):
+            for entry in entries:
+                offset = entry & _QCOW2_OFFSET_MASK
+                if offset:
+                    l2_refs[offset] += 1
+        data_refs = dict.fromkeys(data_order, 0)
+        for offset in l2_order:
+            for l2e in l2_body[offset]:
+                host = l2e & _QCOW2_OFFSET_MASK
+                if host:
+                    data_refs[host] += l2_refs[offset]
+
+        l1a_n = _ceil_div(hdr["l1_size"] * 8, cluster)
+        l1s_n = _ceil_div(kept["l1_size"] * 8, cluster)
+        snap_n = _ceil_div(len(kept["raw"]), cluster)
+        fixed = 1 + l1a_n + l1s_n + snap_n + len(l2_order) + len(data_order)
+        # The refcount structures have to cover a total that includes them, so
+        # size them against their own growth until it settles.
+        per_block = cluster // 2
+        blocks = table_n = 1
+        for _ in range(16):
+            total = fixed + blocks + table_n
+            want_blocks = max(1, _ceil_div(total, per_block))
+            want_table = max(1, _ceil_div(want_blocks * 8, cluster))
+            if (want_blocks, want_table) == (blocks, table_n):
+                break
+            blocks, table_n = want_blocks, want_table
+        else:
+            raise _Qcow2Error("refcount table sizing did not settle")
+        total = fixed + blocks + table_n
+
+        table_c = 1
+        block_c = table_c + table_n
+        l1a_c = block_c + blocks
+        l1s_c = l1a_c + l1a_n
+        snap_c = l1s_c + l1s_n
+        l2_c = snap_c + snap_n
+        data_c = l2_c + len(l2_order)
+
+        counts = [0] * total
+        for start, count in ((0, 1), (table_c, table_n), (block_c, blocks),
+                             (l1a_c, l1a_n), (l1s_c, l1s_n), (snap_c, snap_n)):
+            for i in range(start, start + count):
+                counts[i] = 1
+        for offset, i in l2_at.items():
+            counts[l2_c + i] = l2_refs[offset]
+        for offset, i in data_at.items():
+            counts[data_c + i] = data_refs[offset]
+
+        def moved_l1(entries, mark_copied):
+            moved = []
+            for entry in entries:
+                offset = entry & _QCOW2_OFFSET_MASK
+                if not offset:
+                    moved.append(0)
+                    continue
+                flag = (_QCOW2_FLAG_COPIED
+                        if mark_copied and l2_refs[offset] == 1 else 0)
+                moved.append((l2_c + l2_at[offset]) * cluster | flag)
+            return struct.pack(f">{len(moved)}Q", *moved) if moved else b""
+
+        def moved_l2(entries):
+            moved = []
+            for l2e in entries:
+                host = l2e & _QCOW2_OFFSET_MASK
+                if not host:
+                    # In v3 bit 0 marks a cluster that reads as zeroes; v2 has
+                    # no such flag and every other bit here is reserved.
+                    moved.append(l2e & 1 if hdr["version"] >= 3 else 0)
+                    continue
+                flag = _QCOW2_FLAG_COPIED if data_refs[host] == 1 else 0
+                moved.append((data_c + data_at[host]) * cluster | flag)
+            return struct.pack(f">{per_l2}Q", *moved)
+
+        with dst.open("wb") as out:
+            out.truncate(total * cluster)
+
+            header = bytearray(cluster)
+            header[0:4] = _QCOW2_MAGIC
+            header[4:8] = hdr["version"].to_bytes(4, "big")
+            header[20:24] = hdr["cluster_bits"].to_bytes(4, "big")
+            header[24:32] = hdr["size"].to_bytes(8, "big")
+            header[36:40] = hdr["l1_size"].to_bytes(4, "big")
+            header[40:48] = (l1a_c * cluster).to_bytes(8, "big")
+            header[48:56] = (table_c * cluster).to_bytes(8, "big")
+            header[56:60] = table_n.to_bytes(4, "big")
+            header[60:64] = (1).to_bytes(4, "big")
+            header[64:72] = (snap_c * cluster).to_bytes(8, "big")
+            if hdr["version"] >= 3:
+                header[96:100] = (4).to_bytes(4, "big")
+                header[100:104] = (104).to_bytes(4, "big")
+            out.seek(0)
+            out.write(header)
+
+            refcount_table = [0] * (table_n * cluster // 8)
+            for i in range(blocks):
+                refcount_table[i] = (block_c + i) * cluster
+            out.seek(table_c * cluster)
+            out.write(struct.pack(f">{len(refcount_table)}Q", *refcount_table))
+
+            for i in range(blocks):
+                span = counts[i * per_block:(i + 1) * per_block]
+                block = bytearray(cluster)
+                if span:
+                    struct.pack_into(f">{len(span)}H", block, 0, *span)
+                out.seek((block_c + i) * cluster)
+                out.write(block)
+
+            out.seek(l1a_c * cluster)
+            out.write(moved_l1(active_l1, True))
+            # Snapshot L1 entries never carry COPIED: a snapshot is read-only,
+            # so nothing may ever write over one of its clusters in place.
+            out.seek(l1s_c * cluster)
+            out.write(moved_l1(snap_l1, False))
+
+            entry = bytearray(kept["raw"])
+            entry[0:8] = (l1s_c * cluster).to_bytes(8, "big")
+            out.seek(snap_c * cluster)
+            out.write(entry)
+
+            for offset in l2_order:
+                out.seek((l2_c + l2_at[offset]) * cluster)
+                out.write(moved_l2(l2_body[offset]))
+            for offset in data_order:
+                out.seek((data_c + data_at[offset]) * cluster)
+                out.write(_qcow2_read_at(fh, offset, cluster))
+
+            out.flush()
+            os.fsync(out.fileno())
+
+    return {"clusters": total, "dropped": len(snapshots) - 1}
+
+
+def _qcow2_check_refcounts(fh, hdr: dict) -> None:
+    """Every stored refcount must match what the tables actually reference."""
+    cluster = hdr["cluster"]
+    per_l2 = cluster // 8
+    per_block = cluster // 2
+    total = _ceil_div(fh.seek(0, os.SEEK_END), cluster)
+    expected = [0] * total
+
+    def bump(offset):
+        index = offset // cluster
+        if index >= total:
+            raise _Qcow2Error(f"reference to cluster {index} past the image end")
+        expected[index] += 1
+
+    bump(0)
+    for i in range(hdr["rc_clusters"]):
+        bump(hdr["rc_offset"] + i * cluster)
+    table = struct.unpack(
+        f">{hdr['rc_clusters'] * cluster // 8}Q",
+        _qcow2_read_at(fh, hdr["rc_offset"], hdr["rc_clusters"] * cluster),
+    )
+    for entry in table:
+        if entry & _QCOW2_OFFSET_MASK:
+            bump(entry & _QCOW2_OFFSET_MASK)
+
+    snapshots = _qcow2_read_snapshot_table(fh, hdr)
+    for i in range(_ceil_div(sum(len(s["raw"]) for s in snapshots), cluster)):
+        bump(hdr["snapshots_offset"] + i * cluster)
+
+    tables = [(hdr["l1_offset"], hdr["l1_size"])]
+    tables += [(s["l1_offset"], s["l1_size"]) for s in snapshots]
+    for l1_offset, l1_size in tables:
+        for i in range(_ceil_div(l1_size * 8, cluster)):
+            bump(l1_offset + i * cluster)
+        for entry in _qcow2_read_l1(fh, l1_offset, l1_size):
+            l2_offset = entry & _QCOW2_OFFSET_MASK
+            if not l2_offset:
+                continue
+            bump(l2_offset)
+            for l2e in struct.unpack(
+                f">{per_l2}Q", _qcow2_read_at(fh, l2_offset, cluster)
+            ):
+                if l2e & _QCOW2_OFFSET_MASK:
+                    bump(l2e & _QCOW2_OFFSET_MASK)
+
+    stored = [0] * total
+    for ti, entry in enumerate(table):
+        offset = entry & _QCOW2_OFFSET_MASK
+        if not offset:
+            continue
+        raw = _qcow2_read_at(fh, offset, cluster)
+        base = ti * per_block
+        n = min(per_block, max(0, total - base))
+        if n:
+            stored[base:base + n] = struct.unpack(f">{n}H", raw[:n * 2])
+    if stored != expected:
+        bad = next(i for i in range(total) if stored[i] != expected[i])
+        raise _Qcow2Error(
+            f"cluster {bad} stores refcount {stored[bad]} but the tables "
+            f"reference it {expected[bad]} times")
+
+
+def _qcow2_verify(src: Path, dst: Path, keep: str) -> None:
+    """Prove the rebuilt image still holds everything the archive has to carry.
+
+    Compares the guest-visible bytes of both surviving mappings — the active
+    disk, and the kept snapshot, whose mapping is where the VM state lives — and
+    rechecks the refcounts the rebuild wrote. Anything short of an exact match
+    raises and the caller falls back to the original image."""
+    with src.open("rb") as a, dst.open("rb") as b:
+        src_hdr = _qcow2_parse_header(a)
+        dst_hdr = _qcow2_parse_header(b)
+        for field in ("version", "cluster_bits", "size", "l1_size"):
+            if src_hdr[field] != dst_hdr[field]:
+                raise _Qcow2Error(f"the rebuild changed {field}")
+        if dst_hdr["nb_snapshots"] != 1:
+            raise _Qcow2Error(f"rebuilt image holds {dst_hdr['nb_snapshots']} snapshots")
+
+        src_snap = [s for s in _qcow2_read_snapshot_table(a, src_hdr)
+                    if s["name"] == keep][0]
+        dst_snap = _qcow2_read_snapshot_table(b, dst_hdr)[0]
+        if dst_snap["name"] != keep:
+            raise _Qcow2Error(f"rebuilt image kept {dst_snap['name']!r}, not {keep!r}")
+        for field in ("l1_size", "vm_state_size"):
+            if src_snap[field] != dst_snap[field]:
+                raise _Qcow2Error(f"the rebuild changed the snapshot's {field}")
+
+        cluster = src_hdr["cluster"]
+        for src_l1, dst_l1 in (
+            ((src_hdr["l1_offset"], src_hdr["l1_size"]),
+             (dst_hdr["l1_offset"], dst_hdr["l1_size"])),
+            ((src_snap["l1_offset"], src_snap["l1_size"]),
+             (dst_snap["l1_offset"], dst_snap["l1_size"])),
+        ):
+            want = _qcow2_mapping(a, src_hdr, *src_l1)
+            got = _qcow2_mapping(b, dst_hdr, *dst_l1)
+            if want.keys() != got.keys():
+                raise _Qcow2Error(
+                    f"the rebuild maps {len(got)} clusters where the original "
+                    f"maps {len(want)}")
+            for guest, host in want.items():
+                if (_qcow2_read_at(a, host, cluster)
+                        != _qcow2_read_at(b, got[guest], cluster)):
+                    raise _Qcow2Error(f"guest cluster {guest} differs after the rebuild")
+
+        _qcow2_check_refcounts(b, dst_hdr)
+
+
+def _trim_hdd_image(keep_tag: str) -> Path | None:
+    """A copy of the disk image holding only `keep_tag`, or None to skip it.
+
+    None whenever the rebuild or the check after it is anything but happy, and
+    the caller then serves the untouched image: a bigger archive is a far better
+    outcome than a subtly wrong one."""
+    trimmed = HDD_IMAGE.parent / f".{HDD_IMAGE.name}.trim"
+    try:
+        before = HDD_IMAGE.stat().st_size
+        stats = _qcow2_rebuild(HDD_IMAGE, trimmed, keep_tag)
+        _qcow2_verify(HDD_IMAGE, trimmed, keep_tag)
+        after = trimmed.stat().st_size
+    except (_Qcow2Error, OSError, ValueError, struct.error) as exc:
+        log.warning("state-file: serving the whole image, %s could not be "
+                    "trimmed to %s: %s", HDD_IMAGE, keep_tag, exc)
+        trimmed.unlink(missing_ok=True)
+        return None
+    log.info("state-file: trimmed to %s — %.1f MB from %.1f MB, %d other "
+             "snapshot(s) dropped", keep_tag, after / 2 ** 20, before / 2 ** 20,
+             stats["dropped"])
+    return trimmed
+
+
 def _same_image(qmp_filename: str, path: Path) -> bool:
     """True when the image QEMU reports and `path` are the same file.
 
@@ -659,19 +1096,27 @@ def _capture_state_shot(slot: int) -> bool:
     return True
 
 
-def _zip_hdd_image() -> bytes | None:
+def _zip_hdd_image(keep_tag: str | None = None) -> bytes | None:
     """Zip the hard disk image into memory.
 
     With xemu up the caller must pause the guest first: this is a qcow2 a live
     QEMU holds open, and a copy taken mid-write can catch torn metadata. With
-    xemu gone the image is quiescent and no pause is possible or needed."""
+    xemu gone the image is quiescent and no pause is possible or needed.
+
+    `keep_tag` names the snapshot the archive is for, and the image is rebuilt
+    around it so the other slots do not travel too. The whole image is zipped
+    whenever that rebuild is skipped or refused."""
+    trimmed = _trim_hdd_image(keep_tag) if keep_tag and STATE_TRIM else None
     buf = io.BytesIO()
     try:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(HDD_IMAGE, HDD_IMAGE_ENTRY)
+            zf.write(trimmed or HDD_IMAGE, HDD_IMAGE_ENTRY)
     except OSError as exc:
         log.error("state-file: could not zip %s: %s", HDD_IMAGE, exc)
         return None
+    finally:
+        if trimmed:
+            trimmed.unlink(missing_ok=True)
     return buf.getvalue()
 
 
@@ -1257,8 +1702,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             rom_name = _state["rom_name"]
 
         still_paused = False
+        keep_tag = f"broker-slot-{slot}"
         if not live:
-            content = _zip_hdd_image()
+            content = _zip_hdd_image(keep_tag)
             # A /launch slipping through would put xemu back on the image
             # mid-zip, and half of that archive predates the reopen.
             if _qmp_available():
@@ -1272,7 +1718,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         else:
             try:
-                content = _zip_hdd_image()
+                content = _zip_hdd_image(keep_tag)
             finally:
                 if not _qmp_resume():
                     # A DELETE /launch can kill xemu mid-read, and a dead process

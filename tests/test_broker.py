@@ -777,6 +777,13 @@ def hdd(tmp_path, monkeypatch):
     return path
 
 
+def _zip_members(content):
+    """{name: bytes} for every member of a zip the broker produced."""
+    assert content is not None
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
+
+
 def _zip_bytes(members, compression=zipfile.ZIP_DEFLATED):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression) as zf:
@@ -1018,7 +1025,7 @@ def test_get_state_file_blocks_a_concurrent_save(state_client, monkeypatch):
     entered = threading.Event()
     release = threading.Event()
 
-    def _slow_zip():
+    def _slow_zip(keep_tag=None):
         entered.set()
         release.wait(timeout=10)
         return b"PK\x03\x04 pretend zip"
@@ -1244,7 +1251,7 @@ def test_get_state_file_413_without_zipping_an_oversized_image(state_client, hdd
     """The archive is built in memory, so the limit is enforced before zipping."""
     zipped = []
     paused = []
-    monkeypatch.setattr(broker, "_zip_hdd_image", lambda: zipped.append(1))
+    monkeypatch.setattr(broker, "_zip_hdd_image", lambda keep_tag=None: zipped.append(1))
     monkeypatch.setattr(broker, "_qmp_pause", lambda: paused.append(1) or True)
     monkeypatch.setattr(broker, "HDD_IMAGE_MAX_BYTES", 4)  # hdd holds 14 bytes
     code, _, body = _raw_req(state_client, "GET", "/state-file?slot=3")
@@ -1321,6 +1328,319 @@ def test_qcow2_snapshot_tags_none_on_truncated_table(tmp_path):
 def test_qcow2_snapshot_tags_none_when_count_overruns_the_file(tmp_path):
     img = _qcow2(tmp_path / "d.qcow2", ["broker-slot-1"], nb_override=5)
     assert broker._qcow2_snapshot_tags(img) is None
+
+
+# ── Trimming a state archive to one snapshot ──────────────────────────────────
+#
+# The builder and reader below are deliberately written from the qcow2 spec
+# rather than from broker's own helpers: a rebuild checked with the same code
+# that wrote it would agree with itself no matter how wrong it was.
+
+_CL = 512               # smallest legal cluster, so images stay tiny
+_PER_L2 = _CL // 8      # 64 entries
+_GUEST_CLUSTERS = 256
+_L1_SIZE = -(-_GUEST_CLUSTERS // _PER_L2)
+_COPIED = 1 << 63
+_COMPRESSED = 1 << 62
+
+
+def _build_qcow2(path, active, snapshots=(), *, leaked=0, compressed=False):
+    """Write a structurally valid qcow2.
+
+    `active` and each snapshot mapping are {guest cluster: payload}. A snapshot
+    mapping of None shares the active tables outright, which is the shape QEMU
+    leaves behind right after savevm. `leaked` adds clusters that carry a
+    refcount but that no table points at, which is what an interrupted snapshot
+    job strands in a real image.
+    """
+    body, refs, nxt, l2_indices = {}, {}, [1], set()
+
+    def take(data=b""):
+        idx = nxt[0]
+        nxt[0] += 1
+        body[idx] = bytes(data).ljust(_CL, b"\x00")
+        refs[idx] = 0
+        return idx
+
+    def build(mapping):
+        tables = {}
+        for guest, payload in sorted(mapping.items()):
+            top = guest // _PER_L2
+            if top not in tables:
+                tables[top] = ({}, take())
+            tables[top][0][guest % _PER_L2] = take(payload)
+        l1 = [0] * _L1_SIZE
+        for top, (entries, l2_idx) in tables.items():
+            l1[top] = l2_idx
+            l2_indices.add(l2_idx)
+            packed = [0] * _PER_L2
+            for j, data_idx in entries.items():
+                packed[j] = data_idx * _CL
+            body[l2_idx] = struct.pack(f">{_PER_L2}Q", *packed)
+        return l1
+
+    active_l1 = build(active)
+    snap_l1s = [active_l1[:] if m is None else build(m) for _, m, _ in snapshots]
+
+    l1a_idx = take()
+    snap_l1_idx = [take() for _ in snap_l1s]
+    table_idx = take()
+    leaked_idx = [take(b"stranded by an interrupted job") for _ in range(leaked)]
+
+    def count(l1):
+        for entry in l1:
+            if not entry:
+                continue
+            refs[entry] += 1
+            for l2e in struct.unpack(f">{_PER_L2}Q", body[entry]):
+                if l2e:
+                    refs[l2e // _CL] += 1
+
+    count(active_l1)
+    for l1 in snap_l1s:
+        count(l1)
+    for idx in [l1a_idx, *snap_l1_idx, table_idx, *leaked_idx]:
+        refs[idx] = 1
+
+    for l2_idx in l2_indices:
+        packed = []
+        for l2e in struct.unpack(f">{_PER_L2}Q", body[l2_idx]):
+            if not l2e:
+                packed.append(0)
+                continue
+            flag = _COPIED if refs[l2e // _CL] == 1 else 0
+            packed.append(l2e | flag)
+        if compressed and packed:
+            first = next(i for i, v in enumerate(packed) if v)
+            packed[first] |= _COMPRESSED
+            compressed = False
+        body[l2_idx] = struct.pack(f">{_PER_L2}Q", *packed)
+
+    def pack_l1(l1, mark):
+        out = []
+        for entry in l1:
+            flag = _COPIED if (mark and entry and refs[entry] == 1) else 0
+            out.append((entry * _CL | flag) if entry else 0)
+        return struct.pack(f">{_L1_SIZE}Q", *out)
+
+    body[l1a_idx] = pack_l1(active_l1, True).ljust(_CL, b"\x00")
+    for idx, l1 in zip(snap_l1_idx, snap_l1s):
+        body[idx] = pack_l1(l1, False).ljust(_CL, b"\x00")
+
+    entries = b""
+    for i, ((name, _, vm_size), idx) in enumerate(zip(snapshots, snap_l1_idx)):
+        raw_name, ident = name.encode(), str(i + 1).encode()
+        entries += struct.pack(">QIHHIIQII", idx * _CL, _L1_SIZE, len(ident),
+                               len(raw_name), 0, 0, 0, vm_size, 0)
+        entries += ident + raw_name
+        entries += b"\x00" * (-(len(ident) + len(raw_name)) % 8)
+    assert len(entries) <= _CL, "test snapshot table must fit one cluster"
+    body[table_idx] = entries.ljust(_CL, b"\x00")
+
+    rc_table_idx, rc_block_idx = nxt[0], nxt[0] + 1
+    nxt[0] += 2
+    total = nxt[0]
+    assert total <= _CL // 2, "test image must fit one refcount block"
+    refs[0] = refs[rc_table_idx] = refs[rc_block_idx] = 1
+
+    counts = [0] * total
+    for idx, n in refs.items():
+        counts[idx] = n
+    block = bytearray(_CL)
+    struct.pack_into(f">{total}H", block, 0, *counts)
+    body[rc_block_idx] = bytes(block)
+    table = [0] * (_CL // 8)
+    table[0] = rc_block_idx * _CL
+    body[rc_table_idx] = struct.pack(f">{_CL // 8}Q", *table)
+
+    header = bytearray(_CL)
+    header[0:4] = b"QFI\xfb"
+    header[4:8] = (3).to_bytes(4, "big")
+    header[20:24] = (9).to_bytes(4, "big")
+    header[24:32] = (_GUEST_CLUSTERS * _CL).to_bytes(8, "big")
+    header[36:40] = _L1_SIZE.to_bytes(4, "big")
+    header[40:48] = (l1a_idx * _CL).to_bytes(8, "big")
+    header[48:56] = (rc_table_idx * _CL).to_bytes(8, "big")
+    header[56:60] = (1).to_bytes(4, "big")
+    header[60:64] = len(snapshots).to_bytes(4, "big")
+    header[64:72] = (table_idx * _CL).to_bytes(8, "big")
+    header[96:100] = (4).to_bytes(4, "big")
+    header[100:104] = (104).to_bytes(4, "big")
+    body[0] = bytes(header)
+
+    path.write_bytes(b"".join(body.get(i, bytes(_CL)) for i in range(total)))
+    return path
+
+
+def _read_guest(path, snapshot=None):
+    """{guest cluster: payload} for the active mapping, or for a named snapshot."""
+    raw = path.read_bytes()
+    mask = 0x00FFFFFFFFFFFE00
+    l1_offset = int.from_bytes(raw[40:48], "big")
+    l1_size = int.from_bytes(raw[36:40], "big")
+    if snapshot is not None:
+        pos = int.from_bytes(raw[64:72], "big")
+        for _ in range(int.from_bytes(raw[60:64], "big")):
+            (s_l1, s_size, id_len, name_len, _a, _b, _c,
+             _vm, extra) = struct.unpack(">QIHHIIQII", raw[pos:pos + 40])
+            start = pos + 40 + extra
+            name = raw[start + id_len:start + id_len + name_len].decode()
+            if name == snapshot:
+                l1_offset, l1_size = s_l1, s_size
+                break
+            pos = start + id_len + name_len
+            pos += -(extra + id_len + name_len) % 8
+        else:
+            raise AssertionError(f"{snapshot!r} not in the image")
+    out = {}
+    l1 = struct.unpack(f">{l1_size}Q", raw[l1_offset:l1_offset + l1_size * 8])
+    for i, entry in enumerate(l1):
+        l2_offset = entry & mask
+        if not l2_offset:
+            continue
+        l2 = struct.unpack(f">{_PER_L2}Q", raw[l2_offset:l2_offset + _CL])
+        for j, l2e in enumerate(l2):
+            host = l2e & mask
+            if host:
+                out[i * _PER_L2 + j] = raw[host:host + _CL]
+    return out
+
+
+@pytest.fixture
+def qcow(tmp_path, monkeypatch):
+    """Point HDD_IMAGE at a real qcow2 the trim can be pointed at."""
+    path = tmp_path / "xemu" / "xbox_hdd.qcow2"
+    path.parent.mkdir(parents=True)
+    monkeypatch.setattr(broker, "HDD_IMAGE", path)
+    return path
+
+
+def _payload(tag):
+    return tag.encode().ljust(_CL, b"\x00")
+
+
+def test_trim_keeps_only_the_wanted_snapshot(qcow):
+    _build_qcow2(
+        qcow,
+        {0: _payload("disk-0"), 70: _payload("disk-70")},
+        [("broker-slot-1", {0: _payload("slot1")}, 4096),
+         ("broker-slot-10", {0: _payload("slot10")}, 8192),
+         ("broker-slot-3", {0: _payload("slot3")}, 2048)],
+    )
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    assert trimmed is not None
+    assert broker._qcow2_snapshot_tags(trimmed) == {"broker-slot-10"}
+
+
+def test_trim_preserves_every_guest_cluster(qcow):
+    active = {0: _payload("disk-0"), 63: _payload("disk-63"), 200: _payload("disk-200")}
+    snap = {0: _payload("vm-0"), 130: _payload("vm-130")}
+    _build_qcow2(qcow, active,
+                 [("broker-slot-1", {0: _payload("other")}, 512),
+                  ("broker-slot-10", snap, 8192)])
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    assert _read_guest(trimmed) == active
+    assert _read_guest(trimmed, "broker-slot-10") == snap
+
+
+def test_trim_keeps_the_snapshots_vm_state_size(qcow):
+    """RomM shows the size, and QEMU uses it to find the state on restore."""
+    _build_qcow2(qcow, {0: _payload("d")},
+                 [("broker-slot-10", {1: _payload("v")}, 123456)])
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    raw = trimmed.read_bytes()
+    pos = int.from_bytes(raw[64:72], "big")
+    assert struct.unpack(">QIHHIIQII", raw[pos:pos + 40])[7] == 123456
+
+
+def test_trim_drops_the_other_slots_clusters(qcow):
+    """The point of the exercise: slot 10 must not ship slots 1 and 3."""
+    big = {i: _payload(f"slot1-{i}") for i in range(40)}
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-1", big, 4096),
+                  ("broker-slot-3", dict(big), 4096),
+                  ("broker-slot-10", {0: _payload("keep")}, 4096)])
+    before = qcow.stat().st_size
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    assert trimmed.stat().st_size < before / 2
+    assert b"slot1-39" not in trimmed.read_bytes()
+
+
+def test_trim_drops_leaked_clusters(qcow):
+    """Clusters an interrupted snapshot job stranded are not carried over."""
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-10", {1: _payload("vm")}, 4096)], leaked=20)
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    assert b"stranded by an interrupted job" not in trimmed.read_bytes()
+
+
+def test_trim_preserves_sharing_between_disk_and_snapshot(qcow):
+    """A snapshot sharing the active tables must not be expanded into a copy."""
+    active = {i: _payload(f"d{i}") for i in range(50)}
+    _build_qcow2(qcow, active, [("broker-slot-10", None, 4096)])
+    trimmed = broker._trim_hdd_image("broker-slot-10")
+    assert _read_guest(trimmed) == active
+    assert _read_guest(trimmed, "broker-slot-10") == active
+    # Shared, not duplicated: one copy of the payload, not two.
+    assert trimmed.read_bytes().count(_payload("d49")) == 1
+
+
+def test_trim_refuses_an_unknown_tag(qcow):
+    _build_qcow2(qcow, {0: _payload("d")},
+                 [("broker-slot-1", {1: _payload("v")}, 4096)])
+    assert broker._trim_hdd_image("broker-slot-9") is None
+
+
+def test_trim_refuses_compressed_clusters(qcow):
+    """Compressed descriptors encode the offset differently; do not guess."""
+    _build_qcow2(qcow, {0: _payload("d"), 5: _payload("e")},
+                 [("broker-slot-10", {1: _payload("v")}, 4096)], compressed=True)
+    assert broker._trim_hdd_image("broker-slot-10") is None
+
+
+def test_trim_refuses_a_non_qcow2(qcow):
+    qcow.write_bytes(b"not an image at all")
+    assert broker._trim_hdd_image("broker-slot-10") is None
+
+
+def test_trim_leaves_no_temporary_behind(qcow):
+    _build_qcow2(qcow, {0: _payload("d")},
+                 [("broker-slot-10", {1: _payload("v")}, 4096)])
+    broker._trim_hdd_image("broker-slot-9")   # refused
+    assert not list(qcow.parent.glob(".*.trim"))
+
+
+def test_zip_hdd_image_ships_the_trimmed_copy(qcow):
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-1", {i: _payload(f"a{i}") for i in range(40)}, 4096),
+                  ("broker-slot-10", {0: _payload("keep")}, 4096)])
+    content = _zip_members(broker._zip_hdd_image("broker-slot-10"))
+    assert b"a39" not in content["xbox_hdd.qcow2"]
+    assert not list(qcow.parent.glob(".*.trim"))
+
+
+def test_zip_hdd_image_falls_back_to_the_whole_image(qcow):
+    """A refused trim must still produce a usable archive."""
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-1", {1: _payload("v")}, 4096)])
+    content = _zip_members(broker._zip_hdd_image("broker-slot-9"))
+    assert content["xbox_hdd.qcow2"] == qcow.read_bytes()
+
+
+def test_zip_hdd_image_without_a_tag_ships_the_whole_image(qcow):
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-10", {1: _payload("v")}, 4096)])
+    content = _zip_members(broker._zip_hdd_image())
+    assert content["xbox_hdd.qcow2"] == qcow.read_bytes()
+
+
+def test_zip_hdd_image_honours_state_trim_off(qcow, monkeypatch):
+    monkeypatch.setattr(broker, "STATE_TRIM", False)
+    _build_qcow2(qcow, {0: _payload("disk")},
+                 [("broker-slot-1", {1: _payload("v")}, 4096),
+                  ("broker-slot-10", {2: _payload("w")}, 4096)])
+    content = _zip_members(broker._zip_hdd_image("broker-slot-10"))
+    assert content["xbox_hdd.qcow2"] == qcow.read_bytes()
 
 
 # ── State frames ──────────────────────────────────────────────────────────────
@@ -1608,10 +1928,20 @@ def test_get_state_file_offline_503_when_the_image_is_unreadable(offline_client)
     assert json.loads(body)["error"] == "could not read saved states from the disk image"
 
 
+def test_get_state_file_trims_to_the_slot_it_serves(offline_client, monkeypatch):
+    """Serving slot 3 must not ship the other slots' VM state along with it."""
+    asked = []
+    monkeypatch.setattr(broker, "_zip_hdd_image",
+                        lambda keep_tag=None: asked.append(keep_tag) or b"PK\x03\x04")
+    code, _, _ = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 200
+    assert asked == ["broker-slot-3"]
+
+
 def test_get_state_file_409_when_xemu_restarts_mid_read(offline_client, monkeypatch):
     """A /launch landing during the zip reopens the image, so half the archive
     predates the reopen and the whole thing is untrustworthy."""
-    monkeypatch.setattr(broker, "_zip_hdd_image", lambda: (
+    monkeypatch.setattr(broker, "_zip_hdd_image", lambda keep_tag=None: (
         monkeypatch.setattr(broker, "_qmp_available", lambda: True), b"PK\x03\x04"
     )[1])
     code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
@@ -1672,7 +2002,7 @@ def test_delete_launch_waits_out_a_state_file_transfer(state_client, monkeypatch
     entered = threading.Event()
     release = threading.Event()
 
-    def _slow_zip():
+    def _slow_zip(keep_tag=None):
         entered.set()
         release.wait(timeout=10)
         return b"PK\x03\x04 pretend zip"
@@ -1765,7 +2095,7 @@ def test_get_state_file_does_not_call_a_killed_xemu_paused(state_client, monkeyp
     monkeypatch.setattr(broker, "_qmp_available", lambda: alive[0])
     monkeypatch.setattr(broker, "_qmp_resume", lambda: False)
 
-    def _zip_then_stopped():
+    def _zip_then_stopped(keep_tag=None):
         alive[0] = False  # a DELETE /launch killed xemu during the read
         return b"PK\x03\x04 pretend zip"
 
