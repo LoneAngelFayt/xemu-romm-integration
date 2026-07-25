@@ -20,6 +20,7 @@ Save states are stored as named snapshots inside the HDD image. The HDD image mu
 - Stop xemu when a session ends, so no gameless instance burns CPU at the dashboard
 - Save state support — 9 user slots + 1 autosave slot (slot 10), stored inside the Xbox HDD image
 - Volume and mute control via PulseAudio
+- Reliable sound — creates the PulseAudio sinks selkies captures from before selkies starts, closing a startup race in the base image that silences the stream at random
 - Controller support via the selkies joystick interposer (gamepad auto-configured on port 1)
 - Fills the stream — seeds `fullscreen_on_startup` so xemu's window covers the streamed canvas instead of sitting in a corner of it
 - AMD GPU support — pins the Vulkan renderer in `xemu.toml`, since xemu's OpenGL path hangs the GPU here
@@ -249,6 +250,10 @@ The slot number is a container-side QMP handle only. RomM stores states as histo
 The broker owns the xemu process. The desktop autostart is neutered at startup so no gameless xemu is running at the dashboard; the broker spawns one with a QMP socket when a ROM is launched and kills it when the session ends.
 
 ```
+Startup (init-xemu-audio)
+  └── Wait for PulseAudio to answer, then create the `output`/`input` null sinks
+      before selkies starts: the base image's own setup can lose that race
+
 Startup (init.sh)
   └── Write broker-managed autostart (labwc + openbox): no boot-time xemu
   └── Seed xemu.toml: port1_driver = 'usb-xbox-gamepad'
