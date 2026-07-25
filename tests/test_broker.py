@@ -1099,6 +1099,31 @@ def test_put_state_file_409_while_xemu_runs(client, hdd):
     assert code == 409
 
 
+def test_put_state_file_409_when_xemu_comes_up_during_the_upload(
+    restore_client, hdd, monkeypatch
+):
+    """A 256 MB body takes minutes to read, and the early check is that old by
+    the time the flag is claimed — a launch fits entirely inside the window."""
+    alive = [False]
+    monkeypatch.setattr(broker, "_qmp_available", lambda: alive[0])
+    real_read = broker.BrokerHandler._read_state_body
+
+    def _read_then_launch(self):
+        content = real_read(self)
+        alive[0] = True  # a launch started and finished during the read
+        return content
+
+    monkeypatch.setattr(broker.BrokerHandler, "_read_state_body", _read_then_launch)
+    code, _, body = _raw_req(
+        restore_client, "PUT", "/state-file?filename=Halo.x03", _state_archive()
+    )
+    assert code == 409
+    assert "xemu is running" in json.loads(body)["error"]
+    assert hdd.read_bytes() == b"original image"  # the live qcow2 is untouched
+    with broker._lock:
+        assert broker._state["state_file_in_progress"] is False
+
+
 def test_put_state_file_409_while_saving(restore_client, hdd):
     with broker._lock:
         broker._state["save_in_progress"] = True
@@ -1279,6 +1304,53 @@ def test_delete_launch_waits_out_a_state_file_transfer(state_client, monkeypatch
     assert kills == ["kill"]  # but the stop still wins once the read is done
     with broker._lock:
         assert broker._state["rom_path"] is None
+
+
+def test_delete_launch_waits_out_a_save(client, monkeypatch):
+    """A stop landing mid-save used to SIGTERM QEMU during snapshot-save."""
+    kills = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _slow_save(slot):
+        entered.set()
+        release.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr(broker, "_qmp_save_state", _slow_save)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: kills.append("kill"))
+    monkeypatch.setattr(broker, "STOP_WAIT", 5.0)
+    with broker._lock:
+        broker._state["rom_path"] = "/romm/library/x.iso"
+
+    assert _req(client, "POST", "/save-state", {"slot": 3})[0] == 200
+    assert entered.wait(timeout=5)
+    stop_result = {}
+    stopper = threading.Thread(target=lambda: stop_result.update(
+        resp=_req(client, "DELETE", "/launch")
+    ))
+    stopper.start()
+    try:
+        time.sleep(0.3)
+        assert kills == []       # the snapshot job is not cut in half
+        assert not stop_result   # the stop is still waiting
+    finally:
+        release.set()
+        stopper.join(timeout=10)
+    assert stop_result["resp"][0] == 200
+    assert kills == ["kill"]  # but the stop still wins once the save is done
+
+
+def test_delete_launch_stops_anyway_once_the_window_runs_out(client, monkeypatch):
+    """Stopping is the only way out of a wedged save, so it is never refused."""
+    kills = []
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: kills.append("kill"))
+    monkeypatch.setattr(broker, "STOP_WAIT", 0.3)
+    with broker._lock:
+        broker._state["rom_path"] = "/romm/library/x.iso"
+        broker._state["save_in_progress"] = True  # a save that never concludes
+    assert _req(client, "DELETE", "/launch")[0] == 200
+    assert kills == ["kill"]
 
 
 def test_get_state_file_does_not_call_a_killed_xemu_paused(state_client, monkeypatch):

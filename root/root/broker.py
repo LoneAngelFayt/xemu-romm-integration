@@ -46,8 +46,9 @@ HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
 STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
-# DELETE /launch gives an in-flight /state-file transfer this long to finish
-# before killing xemu anyway — the transfer holds the guest paused mid-read.
+# DELETE /launch gives an in-flight /state-file transfer or snapshot job this
+# long to finish before killing xemu anyway — the transfer holds the guest
+# paused mid-read, and a SIGTERM lands mid-snapshot-save.
 STOP_WAIT = float(os.environ.get("STOP_WAIT", "5.0"))
 
 # Per-socket timeout for an HTTP request. Without one a client that sends
@@ -1404,6 +1405,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": conflict})
             return
         try:
+            # The check above is minutes old for a large upload — a launch can
+            # have started and finished inside the body read, and restoring now
+            # would replace the qcow2 that xemu has open.
+            if _qmp_available():
+                self._send_json(409, {
+                    "error": "xemu is running; stop the session before restoring a state",
+                })
+                return
             self._restore_state_file(filename, content)
         finally:
             _release_state_file()
@@ -1450,17 +1459,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
             with _lock:
                 _state["session_generation"] += 1
 
-            # A /state-file transfer holds the guest paused mid-read; give it a
-            # bounded window to finish so it is not killed under its own feet.
-            # The stop still wins if the window runs out.
+            # A /state-file transfer holds the guest paused mid-read and a save
+            # is a snapshot job SIGTERM would cut in half; give either a bounded
+            # window to finish. The stop still wins if the window runs out.
             deadline = time.monotonic() + STOP_WAIT
             while True:
                 with _lock:
-                    busy = _state["state_file_in_progress"]
-                if not busy:
+                    transferring = _state["state_file_in_progress"]
+                    saving = _state["save_in_progress"]
+                if not (transferring or saving):
                     break
                 if time.monotonic() >= deadline:
-                    log.warning("Stopping xemu with a /state-file transfer still in flight")
+                    log.warning(
+                        "Stopping xemu with %s still in flight",
+                        "a /state-file transfer" if transferring else "a snapshot job",
+                    )
                     break
                 time.sleep(0.1)
 
