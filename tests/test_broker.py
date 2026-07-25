@@ -854,7 +854,7 @@ def test_restore_hdd_image_rejects_extra_members(hdd):
 
 def test_restore_hdd_image_rejects_oversized_member(hdd, monkeypatch):
     # Declared (uncompressed) size is what matters: the archive itself is tiny.
-    monkeypatch.setattr(broker, "STATE_FILE_MAX_BYTES", 128)
+    monkeypatch.setattr(broker, "HDD_IMAGE_MAX_BYTES", 128)
     error = broker._restore_hdd_image(_state_archive(b"\0" * 4096))
     assert error == "archive exceeds size limit when extracted"
     assert hdd.read_bytes() == b"original image"
@@ -1245,7 +1245,7 @@ def test_get_state_file_413_without_zipping_an_oversized_image(state_client, hdd
     paused = []
     monkeypatch.setattr(broker, "_zip_hdd_image", lambda: zipped.append(1))
     monkeypatch.setattr(broker, "_qmp_pause", lambda: paused.append(1) or True)
-    monkeypatch.setattr(broker, "STATE_FILE_MAX_BYTES", 4)  # hdd holds 14 bytes
+    monkeypatch.setattr(broker, "HDD_IMAGE_MAX_BYTES", 4)  # hdd holds 14 bytes
     code, _, body = _raw_req(state_client, "GET", "/state-file?slot=3")
     assert code == 413
     assert json.loads(body)["error"] == "state file exceeds size limit"
@@ -1536,6 +1536,39 @@ def test_get_state_file_offline_does_not_pause(offline_client, monkeypatch):
     code, headers, _ = _raw_req(offline_client, "GET", "/state-file?slot=3")
     assert code == 200
     assert "X-Xemu-Paused" not in headers
+
+
+def test_get_state_file_serves_an_image_bigger_than_the_transfer_limit(
+    offline_client, monkeypatch
+):
+    """A qcow2 holding one ~70MB VM state runs past the 256MB transfer limit
+    while zipping to well under it, so gating the image on that limit rejected
+    saves that transfer fine. Compressible padding stands in for the VM state."""
+    monkeypatch.setattr(broker, "STATE_FILE_MAX_BYTES", 4096)
+    with broker.HDD_IMAGE.open("ab") as fh:
+        fh.write(b"\0" * 200_000)
+    assert broker.HDD_IMAGE.stat().st_size > broker.STATE_FILE_MAX_BYTES
+    code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 200
+    assert len(body) <= broker.STATE_FILE_MAX_BYTES  # the archive still fits
+
+
+def test_get_state_file_413_when_the_image_could_never_be_restored(
+    offline_client, monkeypatch
+):
+    """Past the expanded bound, PUT would refuse the member on the way back."""
+    monkeypatch.setattr(broker, "HDD_IMAGE_MAX_BYTES", 8)
+    assert _raw_req(offline_client, "GET", "/state-file?slot=3")[0] == 413
+
+
+def test_get_state_file_413_when_the_archive_itself_is_too_big(
+    offline_client, monkeypatch
+):
+    """The expanded image passed, but what goes over the wire still has to fit."""
+    monkeypatch.setattr(broker, "STATE_FILE_MAX_BYTES", 8)
+    code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
+    assert code == 413
+    assert json.loads(body)["error"] == "state file exceeds size limit"
 
 
 def test_get_state_file_offline_404_when_slot_empty(offline_client):

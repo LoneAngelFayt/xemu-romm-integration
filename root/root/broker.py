@@ -45,6 +45,11 @@ SETUP_TIMEOUT = float(os.environ.get("SETUP_TIMEOUT", "900"))
 HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
 HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
 STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
+# The archive travels compressed but lands on disk expanded, so the two need
+# separate bounds. Holding the image to the transfer limit rejected real saves:
+# a qcow2 carrying one ~70MB VM state runs past 256MB while zipping to under 50,
+# and the qcow2 never shrinks when a snapshot is deleted, so it only creeps up.
+HDD_IMAGE_MAX_BYTES = int(os.environ.get("HDD_IMAGE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
 # Captured state frames sit beside the disk image so they outlive xemu: RomM
@@ -699,7 +704,7 @@ def _restore_hdd_image(content: bytes) -> str | None:
         members = [i for i in zf.infolist() if not i.is_dir()]
         if len(members) != 1 or members[0].filename != HDD_IMAGE_ENTRY:
             return f"archive must hold exactly one {HDD_IMAGE_ENTRY} member"
-        if members[0].file_size > STATE_FILE_MAX_BYTES:
+        if members[0].file_size > HDD_IMAGE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
         tmp = HDD_IMAGE.parent / f".{HDD_IMAGE.name}.tmp"
 
@@ -1249,17 +1254,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "no state for slot", "slot": slot})
             return
 
-        # Zipping happens entirely in memory, so an image already past the limit
-        # is refused before a compressed copy of it is built. The uncompressed
-        # size is the right bound: _restore_hdd_image rejects a member over the
-        # same limit, so such an archive could never be pushed back anyway.
+        # An image too big to ever be restored is refused before a compressed
+        # copy of it is built. This is the expanded bound, not the transfer one:
+        # what comes back is checked against STATE_FILE_MAX_BYTES once zipped.
         try:
             image_size = HDD_IMAGE.stat().st_size
         except OSError as exc:
             log.error("state-file: could not stat %s: %s", HDD_IMAGE, exc)
             self._send_json(500, {"error": "could not read the hard disk image"})
             return
-        if image_size > STATE_FILE_MAX_BYTES:
+        if image_size > HDD_IMAGE_MAX_BYTES:
             log.error("state-file: %s is %d bytes — over the limit, not zipping",
                       HDD_IMAGE, image_size)
             self._send_json(413, {"error": "state file exceeds size limit"})

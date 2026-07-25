@@ -37,6 +37,33 @@ One consequence: a save state restores the entire console, including every
 title's saves as they stood when it was captured. Restoring an old state for one
 game rolls back in-game saves for other games too.
 
+## State thumbnails
+
+States carry no thumbnail on xemu. `GET /state-screenshot` always returns `404`,
+which RomM treats as "this broker keeps no frames" and displays the state
+without a picture. Every way of capturing a frame inside the container is
+currently closed:
+
+| Approach | Why it fails |
+|---|---|
+| QMP `screendump` | Declared `'if': 'CONFIG_PIXMAN'` in `qapi/ui.json`, and xemu ships without pixman, so the command is not registered. `query-commands` lists 228 commands and no capture command among them |
+| Rebuilding xemu with pixman | `option('pixman')` is `auto`, not disabled, so a rebuild would register the command — but xemu [#774](https://github.com/xemu-project/xemu/issues/774) reports it dumps a stale Xbox logo. The nv2a renderer draws to the host GL surface and never populates the `DisplaySurface` that `screendump` reads, which is also why pixman is absent to begin with |
+| `xwd` against X11 | xemu creates no X window. Under Xwayland only an 8192x8192 unmapped virtual root exists, and `X_GetImage` on it fails `BadMatch` |
+| `grim` against Wayland | The compositor reports no `wlr-screencopy-unstable-v1` on one socket and never delivers a frame on the other |
+
+The `ImageFormat` enum is *not* gated on pixman, so `screendump` and its `ppm`
+and `png` tokens appear in the binary's strings whether or not the command
+exists. Checking for them is not a valid test for support; ask `query-commands`.
+
+**Roadmap: capture the frame in the browser.** RomM already decodes and displays
+every frame client-side, so the one place a frame provably exists is the player
+view. Grabbing it there on save would sidestep the container entirely and give
+one capture path for every streaming emulator, replacing the per-emulator
+server-side handling (PCSX2 embeds a frame in its `.p2s`, Dolphin's broker
+captures one, xemu can do neither). The broker's `/state-screenshot` contract
+and RomM's fetch-and-store path are already built and would keep working for the
+emulators that do serve frames.
+
 ## Usage
 
 ```yaml
@@ -76,7 +103,8 @@ services:
 | `BROKER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `HDD_IMAGE` | `/config/xemu/xbox_hdd.qcow2` | Xbox hard disk image the broker reads and restores as a save state |
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
-| `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state archive in either direction |
+| `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state **archive** in either direction |
+| `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs past 256MB while zipping to under 50MB, and a qcow2 never shrinks when a snapshot is deleted |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
 | `STOP_WAIT` | `5.0` | Max seconds `DELETE /launch` waits for an in-flight `/state-file` transfer or snapshot job before stopping xemu anyway |
 | `BROKER_REQUEST_TIMEOUT` | `60.0` | Per-socket HTTP request timeout; a client that stalls mid-request is dropped rather than holding a handler thread |
@@ -92,6 +120,7 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 | `/health` | GET | `{"status": "ok"}` |
 | `/status` | GET | Session state — see below |
 | `/state-file?slot=N` | GET | The zipped Xbox hard disk image holding slot N's capture, named by `X-State-Filename` |
+| `/state-screenshot?slot=N` | GET | The PNG frame captured when slot N was saved. Always `404` on xemu today — see [State thumbnails](#state-thumbnails) |
 
 **`GET /status` response:**
 ```json
