@@ -909,6 +909,20 @@ def restore_client(client, hdd, monkeypatch):
     return client
 
 
+def _wait_state_file_idle(timeout=5.0):
+    """Block until the request handler has run its finally block.
+
+    The response is written from inside the handler, so a client that has read
+    the last byte has not thereby waited for the flag to be given back."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with broker._lock:
+            if not broker._state["state_file_in_progress"]:
+                return True
+        time.sleep(0.05)
+    return False
+
+
 def test_get_state_file_serves_zipped_image(state_client, hdd):
     code, headers, body = _raw_req(state_client, "GET", "/state-file?slot=3")
     assert code == 200
@@ -917,8 +931,7 @@ def test_get_state_file_serves_zipped_image(state_client, hdd):
     assert "X-Xemu-Paused" not in headers
     with zipfile.ZipFile(io.BytesIO(body)) as zf:
         assert zf.read(broker.HDD_IMAGE_ENTRY) == b"original image"
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_get_state_file_uses_rom_name(state_client):
@@ -936,8 +949,7 @@ def test_get_state_file_rejects_bad_slot(state_client):
 def test_get_state_file_404_when_slot_empty(state_client):
     code, _, _ = _raw_req(state_client, "GET", "/state-file?slot=4")
     assert code == 404
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_get_state_file_503_when_snapshot_query_fails(state_client, monkeypatch):
@@ -961,8 +973,7 @@ def test_get_state_file_500_when_xemu_has_another_image_open(state_client, monke
     assert "different hard disk image" in error["error"]
     assert error["xemu_image"] == "/config/xemu/somewhere_else.qcow2"
     assert error["broker_image"] == str(broker.HDD_IMAGE)
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_get_state_file_500_when_qemu_reports_no_filename(state_client, monkeypatch):
@@ -1053,8 +1064,7 @@ def test_get_state_file_blocks_a_concurrent_save(state_client, monkeypatch):
         release.set()
         getter.join(timeout=10)
     assert result["code"] == 200
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_put_state_file_restores_image(restore_client, hdd):
@@ -1065,8 +1075,7 @@ def test_put_state_file_restores_image(restore_client, hdd):
     assert code == 200
     assert json.loads(body)["filename"] == "Halo.x03"
     assert hdd.read_bytes() == payload
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_put_state_file_rejects_bad_filename(restore_client, hdd):
@@ -1094,8 +1103,7 @@ def test_put_state_file_rejects_corrupt_archive(restore_client, hdd):
     assert "corrupt" in json.loads(body)["error"]
     assert hdd.read_bytes() == b"original image"
     assert not _tmp_image(hdd).exists()
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_put_state_file_409_while_xemu_runs(client, hdd):
@@ -1126,8 +1134,7 @@ def test_put_state_file_409_when_xemu_comes_up_during_the_upload(
     assert code == 409
     assert "xemu is running" in json.loads(body)["error"]
     assert hdd.read_bytes() == b"original image"  # the live qcow2 is untouched
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 def test_put_state_file_409_while_saving(restore_client, hdd):
@@ -1259,8 +1266,7 @@ def test_get_state_file_413_without_zipping_an_oversized_image(state_client, hdd
     assert json.loads(body)["error"] == "state file exceeds size limit"
     assert zipped == []  # no compressed copy was ever built
     assert paused == []  # and the guest was never stopped for it
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 # ── qcow2 snapshot table ──────────────────────────────────────────────────────
@@ -1947,8 +1953,7 @@ def test_get_state_file_409_when_xemu_restarts_mid_read(offline_client, monkeypa
     code, _, body = _raw_req(offline_client, "GET", "/state-file?slot=3")
     assert code == 409
     assert "started" in json.loads(body)["error"]
-    with broker._lock:
-        assert broker._state["state_file_in_progress"] is False
+    assert _wait_state_file_idle()
 
 
 # ── DELETE /launch ────────────────────────────────────────────────────────────
