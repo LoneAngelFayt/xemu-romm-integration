@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import zipfile
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock, Timer
@@ -44,6 +45,15 @@ HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
 HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
 STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
+
+# DELETE /launch gives an in-flight /state-file transfer this long to finish
+# before killing xemu anyway — the transfer holds the guest paused mid-read.
+STOP_WAIT = float(os.environ.get("STOP_WAIT", "5.0"))
+
+# Per-socket timeout for an HTTP request. Without one a client that sends
+# headers and then stalls occupies a handler thread forever, and any exclusion
+# flag that request holds is pinned until the broker restarts.
+REQUEST_TIMEOUT = float(os.environ.get("BROKER_REQUEST_TIMEOUT", "60.0"))
 
 # xemu runs as abc and must be able to write snapshots into a restored image.
 _ABC_UID = int(os.environ.get("PUID", "1000"))
@@ -91,12 +101,38 @@ _state: dict = {
     "started_at": None,
     "save_in_progress": False,
     "launch_in_progress": False,  # guards against concurrent /launch requests
+    "state_file_in_progress": False,  # a /state-file GET or PUT owns the disk image
     "launch_error": None,
+    "resume_error": None,         # slot resume failed but the ROM did launch
     "setup": False,               # gameless xemu is up for configuration
     "setup_timer": None,          # threading.Timer that auto-stops setup
+    # Bumped by DELETE /launch. A background launch carries the value it was
+    # started with, so it can tell that the session it belongs to was stopped.
+    "session_generation": 0,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _session_superseded(generation: int) -> bool:
+    """True once DELETE /launch ended the session a background job belongs to.
+    Caller must hold _lock."""
+    return _state["session_generation"] != generation
+
+
+def _abandon_if_cancelled(generation: int, spawned: bool) -> bool:
+    """Bail out of a background launch that DELETE /launch already stopped.
+
+    The stop wins: an xemu this job spawned after the kill would otherwise
+    outlive it. A reused instance is already dead, so _kill_xemu is a no-op
+    there. Returns True when the caller must return immediately."""
+    with _lock:
+        if not _session_superseded(generation):
+            return False
+    log.info("Session stopped while launching — abandoning this launch")
+    if spawned:
+        _kill_xemu()
+    return True
 
 
 def _validate_rom_path(raw: str) -> Path | None:
@@ -112,14 +148,30 @@ def _validate_rom_path(raw: str) -> Path | None:
 # ── Process lifecycle ─────────────────────────────────────────────────────────
 
 
-def _wait_for_save_idle(deadline: float) -> bool:
-    """Block until no snapshot job is in flight. False on timeout."""
-    while time.monotonic() < deadline:
+def _claim_state_file(deadline: float) -> str | None:
+    """Reserve the disk image for a /state-file transfer.
+
+    Both directions touch the qcow2 the emulator owns, so they must not overlap
+    each other, a snapshot job or a launch. Waits out an in-flight save until
+    `deadline` because RomM fetches straight after POST /save-state. Returns an
+    error string on conflict, None once the flag is held by this caller."""
+    while True:
         with _lock:
+            if _state["state_file_in_progress"]:
+                return "state-file transfer already in progress"
+            if _state["launch_in_progress"]:
+                return "launch in progress"
             if not _state["save_in_progress"]:
-                return True
+                _state["state_file_in_progress"] = True
+                return None
+        if time.monotonic() >= deadline:
+            return "save still in progress"
         time.sleep(0.2)
-    return False
+
+
+def _release_state_file() -> None:
+    with _lock:
+        _state["state_file_in_progress"] = False
 
 
 def _wait_for_no_xemu(timeout: float = 3.0) -> bool:
@@ -207,7 +259,10 @@ def _launch_xemu() -> bool:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setpgrp,  # own process group so killpg is clean
+            # Own process group so killpg is clean. Not preexec_fn=os.setpgrp:
+            # that runs Python between fork and exec, which is unsafe in a
+            # threaded process and rejected outright on free-threaded builds.
+            start_new_session=True,
         )
     except OSError as exc:
         log.error("Failed to launch xemu: %s", exc)
@@ -310,9 +365,19 @@ def _qmp_reset_confirmed(retries: int = 3) -> bool:
             while "return" not in recv_msg():
                 pass
             sock.sendall(json.dumps({"execute": "system_reset"}).encode() + b"\n")
+            # Each recv is capped at what is left of the budget: a full QMP_WAIT
+            # timeout on a recv entered just under the deadline would stretch the
+            # real worst case to twice QMP_WAIT, times `retries`.
             deadline = time.monotonic() + QMP_WAIT
-            while time.monotonic() < deadline:
-                msg = recv_msg()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    msg = recv_msg()
+                except TimeoutError:
+                    break  # budget spent
                 if msg.get("event") == "RESET":
                     log.debug("QMP: RESET event confirmed (attempt %d)", attempt)
                     return True
@@ -354,23 +419,23 @@ def _qmp_get_hdd_node() -> str:
     raise ValueError("ide0-hd0 block node not found")
 
 
-def _qmp_snapshot_tags() -> set:
+def _qmp_snapshot_tags() -> set | None:
     """Every internal snapshot tag on the Xbox hard disk image.
 
-    An empty set on failure would read as "this slot holds no state", so the
-    caller must not treat it as authoritative when xemu is down."""
+    None means the query itself failed. An empty set would read as "this slot
+    holds no state", so failure is never reported that way."""
     try:
         r = _qmp_command("query-block")
     except (OSError, ValueError) as exc:
         log.error("QMP: query-block failed: %s", exc)
-        return set()
+        return None
     for dev in r.get("return", []):
         if dev.get("device") != "ide0-hd0":
             continue
         image = dev.get("inserted", {}).get("image", {})
         return {s.get("name", "") for s in image.get("snapshots", [])}
     log.error("QMP: query-block returned no ide0-hd0 device")
-    return set()
+    return None
 
 
 def _qmp_pause() -> bool:
@@ -423,17 +488,26 @@ def _restore_hdd_image(content: bytes) -> str | None:
         if members[0].file_size > STATE_FILE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
         tmp = HDD_IMAGE.parent / f".{HDD_IMAGE.name}.tmp"
+
+        def drop_tmp() -> None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
         try:
             HDD_IMAGE.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(members[0]) as src, open(tmp, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             os.chown(tmp, _ABC_UID, _ABC_GID)
             os.replace(tmp, HDD_IMAGE)
+        except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
+            # A CRC or deflate-stream mismatch only surfaces while decompressing,
+            # long after the header checks above passed.
+            drop_tmp()
+            return f"archive member is corrupt: {exc}"
         except OSError as exc:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+            drop_tmp()
             return f"could not write the hard disk image: {exc}"
     return None
 
@@ -491,16 +565,29 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
             args["vmstate"] = node
         send_cmd(cmd, args)
 
-        # Wait for the job to conclude
+        # Wait for the job to conclude. Each recv is capped at what is left of
+        # the budget: a full-QMP_WAIT timeout on a recv entered just under the
+        # deadline would stretch the real worst case to twice QMP_WAIT.
         deadline = time.monotonic() + QMP_WAIT
         concluded = False
-        while time.monotonic() < deadline:
-            msg = recv_msg()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                msg = recv_msg()
+            except TimeoutError:
+                break  # budget spent; fall through to the job-cancel path
             if (msg.get("event") == "JOB_STATUS_CHANGE"
                     and msg.get("data", {}).get("id") == job_id
                     and msg.get("data", {}).get("status") == "concluded"):
                 concluded = True
                 break
+
+        # The wait loop leaves a near-zero timeout behind; the teardown commands
+        # below need the full budget again.
+        sock.settimeout(QMP_WAIT)
 
         if not concluded:
             try:
@@ -556,43 +643,94 @@ def _qmp_load_state(slot: int) -> bool:
 # ── ROM loading (background) ──────────────────────────────────────────────────
 
 
-def _do_load_rom(rom_path: str, load_slot: int | None = None) -> None:
+def _do_load_rom(rom_path: str, load_slot: int | None = None,
+                 generation: int | None = None) -> None:
     """Ensure xemu is running, inject ROM, update state, optionally resume from
-    a slot. Runs in a background thread."""
+    a slot. Runs in a background thread.
+
+    `generation` is the session marker read when the launch was claimed; a
+    DELETE /launch bumps it, and every write below is skipped once it differs
+    so a stopped session is never resurrected by this thread."""
     try:
         with _lock:
+            if generation is None:
+                generation = _state["session_generation"]
             _state["launch_error"] = None
+            _state["resume_error"] = None
 
         # Reuse a live instance (disc inject + reset is much faster than a
         # cold boot); spawn one otherwise.
+        spawned = False
         if not _qmp_available():
             if not _launch_xemu():
                 with _lock:
-                    _state["launch_error"] = "Failed to spawn xemu — see container logs"
+                    if not _session_superseded(generation):
+                        _state["launch_error"] = "Failed to spawn xemu — see container logs"
                 return
+            spawned = True
 
         log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
         if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
             log.error("QMP not available after %.0fs — ROM load aborted", QMP_BOOT_TIMEOUT)
             with _lock:
-                _state["launch_error"] = (
-                    f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — ROM load aborted"
-                )
+                if not _session_superseded(generation):
+                    _state["launch_error"] = (
+                        f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — ROM load aborted"
+                    )
+            # Reap only what this launch started: an instance we merely reused
+            # is still running someone's game. A discless xemu left behind
+            # busy-loops CPU cores with nothing to reap it.
+            if spawned:
+                _kill_xemu()
+            return
+
+        # The stop may have landed while xemu was booting; inserting the disc
+        # now would bring the session the user just ended back to life.
+        if _abandon_if_cancelled(generation, spawned):
             return
 
         ok = _qmp_load_rom(rom_path)
         # Load after the ROM is in the drive: the snapshot restores a machine
         # that was already running this disc.
-        if ok and load_slot is not None and not _qmp_load_state(load_slot):
-            log.error("Resume failed: no usable state in slot %d", load_slot)
+        if ok and load_slot is not None:
+            # A resume is a QMP snapshot job just like a save, and two jobs
+            # against the shared vmstate corrupt it — hold the same flag
+            # /save-state holds. The generation is re-read under that lock so a
+            # stop or a save-and-exit landing while the disc went in wins.
+            with _lock:
+                resuming = not _session_superseded(generation)
+                if resuming:
+                    _state["save_in_progress"] = True
+            if resuming:
+                try:
+                    resumed = _qmp_load_state(load_slot)
+                finally:
+                    with _lock:
+                        _state["save_in_progress"] = False
+                if not resumed:
+                    log.error("Resume failed: no usable state in slot %d", load_slot)
+                    # The game did boot, just from scratch — recorded separately
+                    # from launch_error so /status still reports an active session.
+                    with _lock:
+                        if not _session_superseded(generation):
+                            _state["resume_error"] = (
+                                f"no usable state in slot {load_slot} — booted fresh"
+                            )
         with _lock:
-            if ok:
+            superseded = _session_superseded(generation)
+            if superseded:
+                pass  # handled below, outside the lock
+            elif ok:
                 _state["rom_path"] = rom_path
                 _state["rom_name"] = Path(rom_path).stem
                 _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             else:
                 _state["launch_error"] = "Failed to load ROM into xemu — see container logs"
                 log.error("ROM load failed for %s", rom_path)
+        if superseded:
+            # A disc went into an xemu the user had already stopped.
+            log.info("Session stopped mid-launch — discarding the loaded ROM")
+            _kill_xemu()
     finally:
         with _lock:
             _state["launch_in_progress"] = False
@@ -629,6 +767,9 @@ def _setup_expired() -> None:
             return
         _state["setup"] = False
         _state["setup_timer"] = None
+        # The session is gone; leaving started_at behind makes /status report a
+        # start time for an xemu that is about to be killed.
+        _state["started_at"] = None
     log.info("Setup session timed out after %.0fs — stopping xemu", SETUP_TIMEOUT)
     _kill_xemu()
 
@@ -641,31 +782,55 @@ def _end_setup() -> None:
         _state["setup"] = False
 
 
-def _do_setup() -> None:
+def _do_setup(generation: int | None = None) -> None:
     """Boot xemu with no disc so the user can configure it, then arm the
-    auto-expiry watchdog. Runs in a background thread."""
+    auto-expiry watchdog. Runs in a background thread.
+
+    `generation` carries the same stop marker a ROM launch uses: a DELETE
+    /launch must not be followed by a re-armed watchdog."""
     try:
+        with _lock:
+            if generation is None:
+                generation = _state["session_generation"]
+
+        spawned = False
         if not _qmp_available():
             if not _launch_xemu():
                 with _lock:
                     _state["setup"] = False
-                    _state["launch_error"] = "Failed to spawn xemu — see container logs"
+                    if not _session_superseded(generation):
+                        _state["launch_error"] = "Failed to spawn xemu — see container logs"
                 return
+            spawned = True
 
         log.info("Waiting for xemu QMP (up to %.0fs)...", QMP_BOOT_TIMEOUT)
         if not _qmp_wait_ready(QMP_BOOT_TIMEOUT):
             log.error("QMP not available after %.0fs — setup aborted", QMP_BOOT_TIMEOUT)
             with _lock:
                 _state["setup"] = False
-                _state["launch_error"] = (
-                    f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — setup aborted"
-                )
+                if not _session_superseded(generation):
+                    _state["launch_error"] = (
+                        f"xemu QMP not available after {QMP_BOOT_TIMEOUT:.0f}s — setup aborted"
+                    )
             _kill_xemu()
             return
 
-        # No disc inserted: xemu sits at the dashboard / config UI.
+        if _abandon_if_cancelled(generation, spawned):
+            return
+
+        # No disc inserted: xemu sits at the dashboard / config UI. Recheck and
+        # commit under one lock hold: a DELETE landing between them would leave
+        # a stale started_at and a watchdog armed for a torn-down session.
         with _lock:
-            _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            superseded = _session_superseded(generation)
+            if not superseded:
+                _state["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if superseded:
+            log.info("Session stopped mid-setup — leaving no setup session behind")
+            if spawned:
+                _kill_xemu()
+            return
+
         _arm_setup_watchdog()
         log.info("Setup session ready — xemu at the dashboard (auto-stops in %.0fs)", SETUP_TIMEOUT)
     finally:
@@ -721,6 +886,11 @@ def _cleanup_sockets():
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
+    # socketserver applies this to the connection in setup(). Without it a
+    # client can hold a handler thread (and any flag that request claimed)
+    # open forever by never finishing its request.
+    timeout = REQUEST_TIMEOUT
+
     def log_message(self, fmt, *args):
         log.debug("HTTP %s", fmt % args)
 
@@ -765,15 +935,42 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # RomM fetches straight after POST /save-state, whose snapshot job runs
         # in the background. Serving mid-job would ship an image without the
         # capture in it.
-        if not _wait_for_save_idle(time.monotonic() + STATE_GET_WAIT):
-            self._send_json(409, {"error": "save still in progress"})
+        conflict = _claim_state_file(time.monotonic() + STATE_GET_WAIT)
+        if conflict is not None:
+            self._send_json(409, {"error": conflict})
             return
+        try:
+            self._serve_state_file(slot)
+        finally:
+            _release_state_file()
 
+    def _serve_state_file(self, slot: int):
+        """Pause, zip and serve the disk image. Caller holds the state-file flag."""
         if not _qmp_available():
             self._send_json(409, {"error": "xemu is not running"})
             return
-        if f"broker-slot-{slot}" not in _qmp_snapshot_tags():
+        tags = _qmp_snapshot_tags()
+        if tags is None:
+            self._send_json(503, {"error": "could not query xemu for saved states"})
+            return
+        if f"broker-slot-{slot}" not in tags:
             self._send_json(404, {"error": "no state for slot", "slot": slot})
+            return
+
+        # Zipping happens entirely in memory, so an image already past the limit
+        # is refused before a compressed copy of it is built. The uncompressed
+        # size is the right bound: _restore_hdd_image rejects a member over the
+        # same limit, so such an archive could never be pushed back anyway.
+        try:
+            image_size = HDD_IMAGE.stat().st_size
+        except OSError as exc:
+            log.error("state-file: could not stat %s: %s", HDD_IMAGE, exc)
+            self._send_json(500, {"error": "could not read the hard disk image"})
+            return
+        if image_size > STATE_FILE_MAX_BYTES:
+            log.error("state-file: %s is %d bytes — over the limit, not zipping",
+                      HDD_IMAGE, image_size)
+            self._send_json(413, {"error": "state file exceeds size limit"})
             return
 
         with _lock:
@@ -785,11 +982,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
         try:
             content = _zip_hdd_image()
         finally:
-            _qmp_resume()
+            still_paused = False
+            if not _qmp_resume():
+                # A DELETE /launch can kill xemu mid-read, and a dead process
+                # cannot be "stuck paused" — only report that for one that is
+                # still there.
+                if _qmp_available():
+                    # The guest is stuck paused and the session is unusable until
+                    # it is stopped, so the caller is told rather than served a
+                    # bare 200.
+                    still_paused = True
+                    log.error("state-file: xemu stayed paused after reading slot %d", slot)
+                else:
+                    log.info("state-file: xemu was stopped while reading slot %d", slot)
 
         if content is None:
             self._send_json(500, {"error": "could not read the hard disk image"})
             return
+        # Authoritative check on what actually goes over the wire: the image can
+        # grow between the stat above and the read.
         if len(content) > STATE_FILE_MAX_BYTES:
             self._send_json(413, {"error": "state file exceeds size limit"})
             return
@@ -802,6 +1013,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("X-State-Filename", f"{safe_name}.x{slot:02d}")
+        if still_paused:
+            self.send_header("X-Xemu-Paused", "true")
         self.end_headers()
         self.wfile.write(content)
         log.info("state-file: served slot %d as %s.x%02d (%d bytes)",
@@ -825,6 +1038,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 rom_name = _state["rom_name"]
                 started_at = _state["started_at"]
                 launch_error = _state["launch_error"]
+                resume_error = _state["resume_error"]
                 setup = _state["setup"]
             self._send_json(200, {
                 "xemu_running": xemu_up,
@@ -834,6 +1048,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "rom_name": rom_name,
                 "started_at": started_at,
                 "launch_error": launch_error,
+                "resume_error": resume_error,
             })
             return
 
@@ -882,15 +1097,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save in progress"})
                     return
+                if _state["state_file_in_progress"]:
+                    self._send_json(409, {"error": "state-file transfer in progress"})
+                    return
                 if _state["launch_in_progress"]:
                     self._send_json(409, {"error": "launch already in progress"})
                     return
                 _state["launch_in_progress"] = True
+                generation = _state["session_generation"]
             # A real launch supersedes any setup session: cancel its watchdog and
             # clear the flag, then reuse the live xemu to insert the disc.
             _end_setup()
             Thread(
-                target=_do_load_rom, args=(str(rom_path), load_slot), daemon=True
+                target=_do_load_rom, args=(str(rom_path), load_slot, generation), daemon=True
             ).start()
             self._send_json(200, {
                 "status": "loading",
@@ -904,6 +1123,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["rom_path"] is not None:
                     self._send_json(409, {"error": "a game session is active"})
                     return
+                if _state["state_file_in_progress"]:
+                    self._send_json(409, {"error": "state-file transfer in progress"})
+                    return
                 if _state["launch_in_progress"]:
                     self._send_json(409, {"error": "launch already in progress"})
                     return
@@ -913,11 +1135,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _state["setup"] = True
                 _state["launch_in_progress"] = True
                 _state["launch_error"] = None
-            Thread(target=_do_setup, daemon=True).start()
+                _state["resume_error"] = None
+                generation = _state["session_generation"]
+            Thread(target=_do_setup, args=(generation,), daemon=True).start()
             self._send_json(200, {"status": "starting setup", "timeout": SETUP_TIMEOUT})
             return
 
         if self.path == "/save-state":
+            # Body first, flag second: claiming across a client read lets one
+            # request that stalls mid-body pin save_in_progress for good.
+            body = self._read_body()
+            slot = body.get("slot", 1)
+            if not isinstance(slot, int) or not (1 <= slot <= 10):
+                self._send_json(400, {"error": "slot must be 1–10"})
+                return
             with _lock:
                 if _state["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -925,14 +1156,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save already in progress"})
                     return
+                if _state["state_file_in_progress"]:
+                    self._send_json(409, {"error": "state-file transfer in progress"})
+                    return
+                # A launch may be mid-resume, which is a snapshot job on the
+                # same vmstate this save would write.
+                if _state["launch_in_progress"]:
+                    self._send_json(409, {"error": "launch in progress"})
+                    return
                 _state["save_in_progress"] = True
-            body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 10):
-                with _lock:
-                    _state["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–10"})
-                return
 
             def _bg_save(s):
                 try:
@@ -946,6 +1178,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/load-state":
+            # Body first, flag second: claiming across a client read lets one
+            # request that stalls mid-body pin save_in_progress for good.
+            body = self._read_body()
+            slot = body.get("slot", 1)
+            if not isinstance(slot, int) or not (1 <= slot <= 10):
+                self._send_json(400, {"error": "slot must be 1–10"})
+                return
             with _lock:
                 if _state["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -953,16 +1192,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save in progress"})
                     return
+                if _state["state_file_in_progress"]:
+                    self._send_json(409, {"error": "state-file transfer in progress"})
+                    return
+                # A launch resuming from a slot is running a snapshot job of its
+                # own against this same vmstate.
+                if _state["launch_in_progress"]:
+                    self._send_json(409, {"error": "launch in progress"})
+                    return
                 # Hold the same flag a save uses: a load is a QMP snapshot job
                 # too, and two concurrent jobs on the shared vmstate corrupt it.
                 _state["save_in_progress"] = True
-            body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 10):
-                with _lock:
-                    _state["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–10"})
-                return
             try:
                 ok = _qmp_load_state(slot)
             finally:
@@ -975,6 +1215,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/save-and-exit":
+            # Body first, flag second: claiming across a client read lets one
+            # request that stalls mid-body pin save_in_progress for good.
+            body = self._read_body()
+            slot = body.get("slot", 10)
+            if not isinstance(slot, int) or not (0 <= slot <= 10):
+                self._send_json(400, {"error": "slot must be 0–10"})
+                return
+            # Slot 0 is a legacy value meaning "use the autosave slot".
+            if slot == 0:
+                slot = 10
+            wait = body.get("wait", True)
+
             with _lock:
                 if _state["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
@@ -982,19 +1234,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 if _state["save_in_progress"]:
                     self._send_json(409, {"error": "save already in progress"})
                     return
+                if _state["state_file_in_progress"]:
+                    self._send_json(409, {"error": "state-file transfer in progress"})
+                    return
                 _state["save_in_progress"] = True
-
-            body = self._read_body()
-            slot = body.get("slot", 10)
-            if not isinstance(slot, int) or not (0 <= slot <= 10):
-                with _lock:
-                    _state["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 0–10"})
-                return
-            # Slot 0 is a legacy value meaning "use the autosave slot".
-            if slot == 0:
-                slot = 10
-            wait = body.get("wait", True)
+                # This ends the session, so like DELETE /launch it supersedes an
+                # in-flight launch: without the bump the launch would write its
+                # rom_path back over the session the user just exited, and its
+                # slot resume would run a snapshot job against the save below.
+                _state["session_generation"] += 1
 
             def _save_then_exit(s: int) -> bool:
                 ok = False
@@ -1013,6 +1261,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         _state["rom_path"] = None
                         _state["rom_name"] = None
                         _state["started_at"] = None
+                        # The session ended cleanly, so /status must not keep
+                        # reporting errors from it — same as DELETE /launch.
+                        _state["launch_error"] = None
+                        _state["resume_error"] = None
                 return ok
 
             if wait:
@@ -1039,7 +1291,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if self.path == "/mute":
             body = self._read_body()
             if "mute" in body:
-                mute_arg = "1" if body["mute"] else "0"
+                mute = body["mute"]
+                # Bare truthiness would mute on the JSON string "false", i.e. do
+                # the opposite of what the caller asked for.
+                if not isinstance(mute, bool):
+                    self._send_json(400, {"error": "mute must be a boolean"})
+                    return
+                mute_arg = "1" if mute else "0"
             else:
                 mute_arg = "toggle"
             result = _pactl("set-sink-mute", "@DEFAULT_SINK@", mute_arg)
@@ -1076,26 +1334,50 @@ class BrokerHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # Body first, flag second: a client that announces a Content-Length and
+        # then stalls would otherwise pin state_file_in_progress and 409 every
+        # later /launch, /setup, /save-state and /state-file. The archive is
+        # held in memory either way, so nothing is paid for reading it first.
+        content = self._read_state_body()
+        if content is None:
+            return  # the error response is already sent
+
+        # Two restores share one temp file, so they must not interleave; a save
+        # or launch must not run against a disk image being replaced either.
+        conflict = _claim_state_file(time.monotonic())
+        if conflict is not None:
+            self._send_json(409, {"error": conflict})
+            return
+        try:
+            self._restore_state_file(filename, content)
+        finally:
+            _release_state_file()
+
+    def _read_state_body(self) -> bytes | None:
+        """Read the pushed archive. None once an error response has been sent."""
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
             length = 0
         if length <= 0:
             self._send_json(400, {"error": "missing or invalid Content-Length"})
-            return
+            return None
         if length > STATE_FILE_MAX_BYTES:
             self._send_json(413, {"error": "state file exceeds size limit"})
-            return
+            return None
         content = self.rfile.read(length)
         if len(content) != length:
             self._send_json(400, {"error": "truncated request body"})
-            return
+            return None
+        return content
 
+    def _restore_state_file(self, filename: str, content: bytes):
+        """Swap in the pushed disk image. Caller holds the flag."""
         error = _restore_hdd_image(content)
         if error is not None:
             self._send_json(400, {"error": error})
             return
-        log.info("state-file: restored %s (%d bytes)", filename, length)
+        log.info("state-file: restored %s (%d bytes)", filename, len(content))
         self._send_json(200, {"status": "ok", "filename": filename})
 
     def do_DELETE(self):
@@ -1106,12 +1388,37 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # Ends a game session or a setup session. Kill rather than eject to
             # the dashboard: an idle xemu busy-loops several CPU cores under
             # software rendering.
+            #
+            # Stopping is never refused — it is the only way out of a hung
+            # launch — so instead of a 409 the marker below tells a background
+            # launch its session is gone before it writes any state back.
+            with _lock:
+                _state["session_generation"] += 1
+
+            # A /state-file transfer holds the guest paused mid-read; give it a
+            # bounded window to finish so it is not killed under its own feet.
+            # The stop still wins if the window runs out.
+            deadline = time.monotonic() + STOP_WAIT
+            while True:
+                with _lock:
+                    busy = _state["state_file_in_progress"]
+                if not busy:
+                    break
+                if time.monotonic() >= deadline:
+                    log.warning("Stopping xemu with a /state-file transfer still in flight")
+                    break
+                time.sleep(0.1)
+
             _end_setup()
             _kill_xemu()
             with _lock:
                 _state["rom_path"] = None
                 _state["rom_name"] = None
                 _state["started_at"] = None
+                # Errors describe the session that was just ended explicitly;
+                # /status must not keep reporting them afterwards.
+                _state["launch_error"] = None
+                _state["resume_error"] = None
             log.info("Session ended via DELETE /launch — xemu stopped")
             self._send_json(200, {"status": "ok"})
             return
@@ -1129,14 +1436,15 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
     log.info("Received signal %d — beginning graceful shutdown", signum)
     Thread(target=server.shutdown, daemon=True).start()
 
-    deadline = time.monotonic() + max(QMP_WAIT, 5.0)
+    wait = max(QMP_WAIT, 5.0)
+    deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         with _lock:
             if not _state["save_in_progress"]:
                 break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight snapshot did not conclude within %.1fs", QMP_WAIT)
+        log.warning("Shutdown: in-flight snapshot did not conclude within %.1fs", wait)
 
     _kill_xemu()
     log.info("Shutdown complete")

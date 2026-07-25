@@ -78,10 +78,12 @@ services:
 | `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
 | `STATE_FILE_MAX_BYTES` | `268435456` | Size ceiling for a state archive in either direction |
 | `STATE_GET_WAIT` | `30.0` | Max seconds `GET /state-file` waits for an in-flight save to finish |
+| `STOP_WAIT` | `5.0` | Max seconds `DELETE /launch` waits for an in-flight `/state-file` transfer before stopping xemu anyway |
+| `BROKER_REQUEST_TIMEOUT` | `60.0` | Per-socket HTTP request timeout; a client that stalls mid-request is dropped rather than holding a handler thread |
 
 ## Broker API
 
-All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is configured. Read endpoints are always public.
+Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is configured. `GET /health` is the only exception, so container healthchecks still work.
 
 ### Read
 

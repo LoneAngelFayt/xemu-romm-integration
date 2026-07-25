@@ -12,12 +12,18 @@ rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[xemu-broker-mod] Cleaned up stale display sockets."
 
 # ── python3 availability ─────────────────────────────────────────────────────
-_need_apt=0
-command -v python3 &>/dev/null || _need_apt=1
-if [ "$_need_apt" = "1" ]; then
+# python3 runs the broker itself plus both config steps below. A failed install
+# used to surface only as xemu never starting, so it is reported here in full;
+# the script stays non-fatal because an s6 init must not abort container startup.
+_have_python=1
+if ! command -v python3 &>/dev/null; then
     echo "[xemu-broker-mod] Installing missing packages (python3)..."
     apt-get update -qq && apt-get install -y -qq python3 \
-        || echo "[xemu-broker-mod] ERROR: apt-get install failed"
+        || echo "[xemu-broker-mod] ERROR: apt-get install python3 failed"
+    command -v python3 &>/dev/null || _have_python=0
+fi
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: python3 is NOT on PATH after the install attempt — the RomM broker will not start, the xemu.toml seed (gamepad driver + Vulkan renderer pin) will be skipped and the per-container Xbox hard disk image will not be copied."
 fi
 
 # ── Disable boot-time xemu in the desktop autostart ──────────────────────────
@@ -52,8 +58,23 @@ done
 # Keys are only written if not already present so user edits are preserved.
 XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
 
+# amdgpu can be built into the kernel instead of loaded as a module, and then
+# /proc/modules says nothing about it — silently skipping the Vulkan pin and
+# leaving xemu on the OpenGL path that hangs the GPU. Fall back to the DRM
+# sysfs vendor id (0x1002 is AMD), which is there either way.
 _amd_gpu=0
-grep -q '^amdgpu ' /proc/modules 2>/dev/null && _amd_gpu=1
+if grep -q '^amdgpu ' /proc/modules 2>/dev/null; then
+    _amd_gpu=1
+else
+    for _vendor_file in /sys/class/drm/card*/device/vendor; do
+        [ -r "$_vendor_file" ] || continue
+        read -r _vendor_id < "$_vendor_file" 2>/dev/null || continue
+        if [ "$_vendor_id" = "0x1002" ]; then
+            _amd_gpu=1
+            break
+        fi
+    done
+fi
 
 if [ "$_amd_gpu" = "1" ]; then
     echo "[xemu-broker-mod] AMD GPU detected — will pin Vulkan renderer."
@@ -61,6 +82,9 @@ else
     echo "[xemu-broker-mod] No AMD GPU detected — skipping renderer seed."
 fi
 
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: skipping xemu.toml seed (port1_driver, renderer pin) — python3 is missing."
+else
 python3 - "$XEMU_CONFIG" "$_amd_gpu" <<'PYEOF'
 import sys, re
 from pathlib import Path
@@ -104,6 +128,7 @@ if amd_gpu:
 
 p.write_text(text)
 PYEOF
+fi
 
 # ── Per-container Xbox hard disk image ───────────────────────────────────────
 # xemu writes save-state snapshots INTO the hard disk qcow2. The stock image
@@ -113,6 +138,9 @@ PYEOF
 HDD_LOCAL="/config/xemu/xbox_hdd.qcow2"
 HDD_STOCK="${HDD_STOCK:-/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2}"
 
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: skipping the per-container hard disk image copy — python3 is missing; xemu will share the stock image and save states may collide between containers."
+else
 python3 - "$XEMU_CONFIG" "$HDD_LOCAL" "$HDD_STOCK" <<'PYEOF'
 import os, re, shutil, sys
 from pathlib import Path
@@ -137,18 +165,28 @@ def usable(p):
 
 
 # hdd_path is rewritten to the local copy on first run, so it stops being a
-# usable source. Keep the stock image as the fallback origin.
-source = Path(current) if current and Path(current) != local else stock
+# usable source. The stock image is the fallback origin, so a custom hdd_path
+# that is missing or truncated must not stop the copy from happening — without
+# the fallback no container-local image is ever made and /state-file 500s.
+sources = []
+if current and Path(current) != local:
+    sources.append(Path(current))
+if stock not in sources:
+    sources.append(stock)
 
 if usable(local):
     print('[xemu-broker-mod] Hard disk image already container-local.')
 else:
     if local.exists():
         print(f'[xemu-broker-mod] {local} is not a usable qcow2, recopying.')
-    if not usable(source):
-        print(f'[xemu-broker-mod] ERROR: no usable stock hard disk image at {source}, '
+    source = next((s for s in sources if usable(s)), None)
+    if source is None:
+        tried = ', '.join(str(s) for s in sources)
+        print(f'[xemu-broker-mod] ERROR: no usable stock hard disk image at {tried}, '
               'leaving hdd_path alone.')
         sys.exit(0)
+    if source != sources[0]:
+        print(f'[xemu-broker-mod] {sources[0]} is not usable — falling back to {source}.')
     local.parent.mkdir(parents=True, exist_ok=True)
     # Copy via a temp name so an interrupted copy never lands on the real
     # path, where the next run would accept it as done.
@@ -178,12 +216,19 @@ else:
 config.write_text(text)
 print(f'[xemu-broker-mod] Pointed hdd_path at {local}.')
 PYEOF
+fi
 
-chown -R abc:abc /config/xemu 2>/dev/null || true
+# A silent failure here only shows up much later as xemu being unable to write
+# its config or a save state, so it is reported but kept non-fatal.
+chown -R abc:abc /config/xemu 2>/dev/null \
+    || echo "[xemu-broker-mod] WARNING: could not chown /config/xemu to abc:abc; xemu may fail to write save state."
 
 # ── Fix ownership so xemu (running as abc) can write its config ───────────────
-chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null || true
-echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."
+if chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null; then
+    echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."
+else
+    echo "[xemu-broker-mod] WARNING: could not chown $(dirname "$XEMU_CONFIG") to abc:abc; xemu may fail to write its config."
+fi
 
 # ── Input device name diagnostic (DEBUG only) ────────────────────────────────
 if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
