@@ -9,18 +9,18 @@ The broker owns the xemu process. It spawns xemu with a QMP socket when a ROM is
 ## Features
 
 - Launch Xbox ROMs on demand from RomM (XISO `.iso`)
-- Save states: 9 user slots plus an autosave slot, exportable into the RomM library and resumable on any container
+- Save states are exportable into the RomM library and resumable on any container
 - A hard disk image per game, swapped in at launch, so one game's writes never inflate another's saves
 - Thumbnails captured for each state
 - Volume and mute control via PulseAudio
 - Controller support through the selkies joystick interposer, gamepad auto-configured on port 1
 - Sound that works, by creating the PulseAudio sinks selkies captures from before selkies starts and closing a race in the base image that silences the stream at random
-- A window that fills the stream, by seeding `fullscreen_on_startup` so xemu does not draw in a corner of the canvas
+- A window that fills the stream, by seeding `fullscreen_on_startup`
 - Vulkan pinned on AMD hosts, where xemu's OpenGL path hangs the GPU. NVIDIA keeps xemu's default
 
 ## Before you start
 
-xemu needs BIOS files and a hard disk image before it will run anything. Open the container's web interface and set:
+xemu needs BIOS files and a hard disk image before it will run anything. You will need to provide these on your own. Open the container's web interface and set:
 
 - **MCPX boot ROM** — `mcpx_1.0.bin`
 - **Xbox BIOS** — e.g. `complex_4627v1.03.bin`
