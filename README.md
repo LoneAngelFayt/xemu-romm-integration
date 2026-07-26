@@ -136,7 +136,9 @@ If no xemu is running, it spawns one with the disc already in the drive (`-dvd_p
 
 **A cold start must never be reset.** QMP starts answering about a second in, while the guest is still inside the MCPX bootrom, and a reset landing there wedges the machine: it stays `running` and burns a full core, but never draws a frame or plays a sample.
 
-`rom_path` may be a file or a **directory**, for libraries laid out one game per folder. RomM addresses those games by folder, so the broker looks inside — the folder itself first, then one level down for the per-disc subfolders some sets use. Only XISO images count (`.iso`, including the `.xiso.iso` double extension), ranked by name so a multi-disc set boots disc 1. Dot-files are skipped and a symlink pointing outside `ROM_ROOT` is never chosen. A directory with no disc inside returns `422` listing the accepted extensions.
+`rom_path` may be a file or a **directory**, for libraries laid out one game per folder. RomM addresses those games by folder, so the broker looks inside, in the folder itself and one level down for the per-disc subfolders some sets use. Only XISO images count (`.iso`, including the `.xiso.iso` double extension). Everything found across both levels is ranked together by disc number, then depth, then name, so a multi-disc set starts on disc 1. The marker is read from the file or folder name (`Disc 1`, `(Disc 2)`, `CD1`) and compared as a number rather than as text, which keeps disc 2 ahead of disc 10; a name mentioning no disc counts as disc 1. Dot-files are skipped and a symlink pointing outside `ROM_ROOT` is never chosen. A directory with no disc inside returns `422` listing the accepted extensions.
+
+Resolution only chooses where a session starts. There is no disc swapping, so a game that asks for its next disc cannot be given one.
 
 #### POST /setup
 

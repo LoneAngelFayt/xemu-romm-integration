@@ -868,6 +868,22 @@ def test_resolve_rom_file_looks_one_level_into_per_disc_subfolders(rom_root):
     assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == disc1
 
 
+def test_resolve_rom_file_puts_disc_two_ahead_of_disc_ten(rom_root):
+    """Disc order is numeric. Sorting the names as text puts 'Disc 10' ahead of
+    'Disc 2', which starts a long set on the wrong disc."""
+    disc2 = _disc(rom_root, "xbox/Game/Game (Disc 2).iso")
+    _disc(rom_root, "xbox/Game/Game (Disc 10).iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == disc2
+
+
+def test_resolve_rom_file_reads_a_disc_number_off_the_subfolder(rom_root):
+    """The marker may be on the folder rather than the file, and only one of the
+    two inner names sorts the way the disc order needs."""
+    disc1 = _disc(rom_root, "xbox/Game/Disc 1/zzz.iso")
+    _disc(rom_root, "xbox/Game/Disc 2/aaa.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == disc1
+
+
 def test_resolve_rom_file_prefers_the_top_level_disc_over_a_nested_one(rom_root):
     top = _disc(rom_root, "xbox/Game/Game.iso")
     _disc(rom_root, "xbox/Game/extras/bonus.iso")
