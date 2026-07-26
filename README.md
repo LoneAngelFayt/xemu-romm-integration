@@ -26,6 +26,7 @@ Save states are stored as named snapshots inside the HDD image. The HDD image mu
 - AMD GPU support — pins the Vulkan renderer in `xemu.toml`, since xemu's OpenGL path hangs the GPU here
 - Save states importable into the RomM library, and resumable on any container
 - Per-container Xbox hard disk image, so players never share save data
+- Per-game hard disk image, swapped in at launch, so one game's writes never inflate another game's state archives
 
 ## Why there is no in-game save sync
 
@@ -35,19 +36,18 @@ need both a qcow2 reader and a FATX reader written from scratch to reach, and
 the broker is stdlib only. Save states carry the whole disk image instead, so
 in-game saves travel inside them.
 
-One consequence: a save state restores the entire console, including every
-title's saves as they stood when it was captured. Restoring an old state for one
-game rolls back in-game saves for other games too.
+One consequence: a save state restores the entire console as it stood when the
+state was captured, including that title's in-game saves. Each game plays off its
+own disk image, so restoring an old state rolls back only its own game.
 
 ## Roadmap
 
 ### Per-user hard disk, carried like a memory card
 
-The hard disk is currently a fixture of the container: one image, shared by
-whoever streams next, holding every title's in-game saves for every user on the
-platform. That is the wrong owner. It makes one player's progress visible to the
-next, it makes the image grow without bound as users accumulate, and it is why a
-state archive has to carry the whole console.
+Hard disks are currently a fixture of the container: one image per game, shared
+by whoever streams that game next, holding its in-game saves for every user on
+the platform. That is the wrong owner. It makes one player's progress visible to
+the next, and it makes each image grow without bound as users accumulate.
 
 The idea is to make the image a per-user asset RomM stores and hands back at
 launch, the way a memory card follows its owner rather than living in the
@@ -67,7 +67,9 @@ Wayland mode. `init.sh` enables its Computer Use HTTP server by writing
 `PIXELFLUX_CU` into the container environment before selkies starts, so
 thumbnails need no configuration from whoever installs the mod. At save time the
 broker posts `{"action": "screenshot"}` to it and stores the base64 PNG that
-comes back beside the disk image, where `GET /state-screenshot` serves it.
+comes back beside the disk image, where `GET /state-screenshot` serves it. A
+frame belongs to the disk image it was captured from, so it travels with that
+image when games are swapped — see [Per-game hard disks](#per-game-hard-disks).
 
 What comes back is the composited output — the picture the player is actually
 looking at — which is why this works where `screendump` would not.
@@ -144,7 +146,8 @@ services:
 | `SETUP_TIMEOUT` | `900.0` | Seconds a `/setup` session stays up before the broker auto-stops idle xemu |
 | `BROKER_LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `HDD_IMAGE` | `/config/xemu/xbox_hdd.qcow2` | Xbox hard disk image the broker reads and restores as a save state |
-| `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image `init.sh` copies from when the container-local one is missing or unusable |
+| `HDD_STOCK` | `/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2` | Stock image copied from when a container-local or per-game disk is missing or unusable |
+| `HDD_STORE` | `/config/xemu/hdd` | Where each game's own hard disk image is kept while another game is playing — see [Per-game hard disks](#per-game-hard-disks) |
 | `STATE_FILE_MAX_BYTES` | `2147483648` | Size ceiling for a state **archive** in either direction. Set to match the expanded ceiling below so that one is what binds: a zip of a qcow2 is never bigger than the qcow2, so this is a backstop rather than a limit real saves meet. A first save is the largest one — the image is at its fattest before the trim has an older snapshot to drop |
 | `HDD_IMAGE_MAX_BYTES` | `2147483648` | Size ceiling for the **expanded** hard disk image. Separate from the archive limit because a qcow2 carrying a ~70MB VM state runs well past its own zipped size, and a qcow2 never shrinks when a snapshot is deleted |
 | `STATE_TRIM` | `1` | Rebuild the image around the one snapshot being served so the other slots do not ship inside the archive. `0` serves the whole image, which is also where any failed or refused rebuild falls back to |
@@ -177,14 +180,17 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
   "rom_name": "Fable",
   "started_at": "2026-04-25T11:50:00Z",
   "launch_error": null,
-  "resume_error": null
+  "resume_error": null,
+  "hdd_error": null
 }
 ```
 `active` is true only when xemu is reachable via QMP **and** a ROM has been loaded. `setup` is true only when xemu is up for a `/setup` configuration session with no ROM loaded, so `active` and `setup` are never both true.
 
 `launch_error` is `null` on success; after a failed `/launch` it holds the reason (QMP never came up, or the ROM could not be loaded) so the frontend can show why the game never started. When it is set there is no session — `active` is false.
 
-`resume_error` is the opposite case: the ROM did launch, but the `load_slot` it was asked to resume from held no usable state, so the game booted fresh. `active` stays true and `launch_error` stays `null`, so this is the only field telling the frontend the player is not where they left off. Both clear at the start of the next launch and when a session ends via `DELETE /launch` or `/save-and-exit`.
+`resume_error` is the opposite case: the ROM did launch, but the `load_slot` it was asked to resume from held no usable state, so the game booted fresh. `active` stays true and `launch_error` stays `null`, so this is the only field telling the frontend the player is not where they left off.
+
+`hdd_error` is set when the game launched on a hard disk image that is not its own, which happens when the stock image is missing or unusable, when the game's own disk could not be swapped in, or when xemu never let go of the mounted one. The game plays normally, so `active` stays true and `launch_error` stays `null`, but its state archives will carry the previous game's data and grow accordingly — see [Per-game hard disks](#per-game-hard-disks). All three fields clear at the start of the next launch and when a session ends via `DELETE /launch` or `/save-and-exit`.
 
 ### Write
 
@@ -193,7 +199,7 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 | `/launch` | POST | `{"rom_path": "...", "load_slot": 1–10}` | Inject a ROM and boot the console, optionally resuming from a slot |
 | `/setup` | POST | — | Boot xemu with no disc at the dashboard so it can be configured, auto-stopping after `SETUP_TIMEOUT` |
 | `/launch` | DELETE | — | End the active game or setup session and stop xemu |
-| `/state-file?filename=<name>.xNN` | PUT | Zipped hard disk image | Restore a state pulled from RomM. Rejected while xemu is running |
+| `/state-file?filename=<name>.xNN` | PUT | Zipped hard disk image | Restore a state pulled from RomM. Rejected while xemu is running, and rejected with `400` unless the archive holds exactly one member that is a hard disk image xemu could open, so the live disk is never displaced for something unbootable |
 | `/cleanup` | POST | — | Restart selkies to flush stale gamepad sockets |
 | `/save-and-exit` | POST | `{"slot": 0–10, "wait": true\|false}` | Save (slot defaults to 10, the autosave slot) and stop xemu |
 | `/save-state` | POST | `{"slot": 1–10}` | Save state to the given slot |
@@ -262,6 +268,20 @@ Sets the PulseAudio default sink volume. Returns `{"status": "ok", "level": <N>}
 #### `/mute` (POST)
 
 Sets or toggles mute on the PulseAudio default sink. Omit `mute` for toggle. Returns `{"status": "ok", "mute": true|false}`.
+
+## Per-game hard disks
+
+Every game plays off its own hard disk image. `HDD_STORE` holds one qcow2 per ROM; at launch the live image is moved into the store under the outgoing game's name and the incoming game's image takes its place, or a fresh copy of `HDD_STOCK` does if that game has never been played. A file named `current` in the store records whose disk is mounted, so a container restart does not lose track and file an image under the wrong name.
+
+This exists because a state archive is the whole disk image. Xbox titles write their caches and saves to the hard disk, so on one shared disk every archive carries every game ever played: measured on the live host, a 50MB MechAssault state came back at 590MB after two Fable sessions had touched the same disk. Trimming cannot reach this, because those clusters belong to the active disk rather than to the snapshots the trim drops.
+
+The swap needs xemu stopped, since QEMU holds the image open. A launch that has to exchange the disk therefore stops any running instance and cold-boots from the disc, giving up the disc-inject shortcut. Launching the game already on the live disk costs nothing, and neither does a resume: `PUT /state-file` marks the restored image as belonging to whichever game is launched next, which is always the game the archive came from.
+
+A game's [state thumbnails](#state-thumbnails) go with it. Each frame pictures a snapshot inside one disk image, so they move into `<image>.shots` alongside the disk being parked and come back with it, rather than staying behind to caption the next game's slots.
+
+Nothing is ever deleted, and nothing prunes the store: it grows by one image per game played, each the size of that game's disk. If neither the game's own disk nor a usable stock image exists, or if the swap fails and the outgoing disk goes back in place, the launch goes ahead on the disk already mounted rather than failing, and `/status` reports it in `hdd_error`. The only case that refuses a launch outright is a swap whose rollback also failed, since then there is no disk left to boot.
+
+An image the broker cannot attribute to a game is filed as `unclaimed-N.qcow2` rather than discarded, because it can hold the only copy of an in-game save nobody ever pulled a state for. Two things produce one: the shared disk in place before this feature existed, and a `current` record that failed to write and so named a game whose disk was already filed. No launch reads an unclaimed image back in, so recovering one is a manual job. Image names are `<title>-<digest>.qcow2`, where the title half is only there to be read and the digest is what identifies the ROM, so the name cannot be worked out by hand: play the game the image belongs to once, which files a disk of its own under the right name, then stop the container and replace that file with the unclaimed image.
 
 ## Save States
 

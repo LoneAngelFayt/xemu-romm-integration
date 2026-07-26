@@ -8,6 +8,8 @@ dashboard, so no gameless instance is ever kept around."""
 
 import base64
 import binascii
+import filecmp
+import hashlib
 import hmac
 import io
 import json
@@ -24,7 +26,7 @@ import time
 import urllib.request
 import zipfile
 import zlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock, Timer
@@ -48,6 +50,24 @@ SETUP_TIMEOUT = float(os.environ.get("SETUP_TIMEOUT", "900"))
 # into it, and there is no way to export one snapshot on its own.
 HDD_IMAGE = Path(os.environ.get("HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2"))
 HDD_IMAGE_ENTRY = "xbox_hdd.qcow2"
+
+# One disk image per game, swapped in at launch. Xbox titles write their caches
+# and saves to the hard disk, and a state archive is the whole image, so a shared
+# disk makes every state carry every game ever played: measured on the live host,
+# a 50MB MechAssault state came back at 590MB after two Fable sessions had
+# touched the same disk. Trimming cannot help, since those clusters belong to the
+# active disk and not to the snapshots it drops.
+HDD_STORE = Path(os.environ.get("HDD_STORE", str(HDD_IMAGE.parent / "hdd")))
+# Which game the live image belongs to, kept on disk so a container restart does
+# not lose track of whose disk is mounted and park it under the wrong name.
+_HDD_OWNER_NAME = "current"
+# The live image came from a pushed state archive, so it belongs to whichever
+# game is launched next: RomM restores a state and then launches its game.
+_HDD_OWNER_RESTORED = ":restored:"
+# Where init.sh takes the first copy from. Same default, so a swap for a game
+# with no disk of its own starts from exactly what a fresh container starts from.
+HDD_STOCK = Path(os.environ.get(
+    "HDD_STOCK", "/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2"))
 # Sized so the expanded-image ceiling below is what actually binds: a zip of a
 # qcow2 is never larger than the qcow2, so an image small enough to serve is an
 # archive small enough to send, and this stays a backstop against a runaway
@@ -167,6 +187,10 @@ _state: dict = {
     "state_file_reading": False,
     "launch_error": None,
     "resume_error": None,         # slot resume failed but the ROM did launch
+    # The game is running on a disk that is not its own, so its states will carry
+    # another game's data. Reported, not fatal: it is how launches worked before
+    # per-game images.
+    "hdd_error": None,
     "setup": False,               # gameless xemu is up for configuration
     "setup_timer": None,          # threading.Timer that auto-stops setup
     # Bumped by DELETE /launch. A background launch carries the value it was
@@ -1229,6 +1253,287 @@ def _zip_hdd_image(keep_tag: str | None = None) -> bytes | None:
     return buf.getvalue()
 
 
+# ── Per-game disk images ──────────────────────────────────────────────────────
+
+_HDD_KEY_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _usable_qcow2(path: Path) -> bool:
+    """Whether xemu could actually open `path`.
+
+    A half-copied image is worse than a missing one: xemu falls back to its
+    first-run wizard and the container looks like it was never set up. So a whole
+    header has to be there and the file has to reach past the L1 table that
+    header points at, which is what an interrupted copy does not do."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(72)
+        if len(head) < 72 or head[:4] != _QCOW2_MAGIC:
+            return False
+        # qcow2 header: l1_size is a u32 at byte 36, l1_table_offset a u64 at 40.
+        l1_size = int.from_bytes(head[36:40], "big")
+        l1_offset = int.from_bytes(head[40:48], "big")
+        return path.stat().st_size >= l1_offset + l1_size * 8
+    except OSError:
+        return False
+
+
+def _shot_store_for(image: Path) -> Path:
+    """Where the thumbnails belonging to a stored disk image live."""
+    return image.with_name(f"{image.name}.shots")
+
+
+def _move_state_shots(dest: Path) -> None:
+    """Best-effort: move the live thumbnails into `dest`.
+
+    Each frame pictures a snapshot inside one disk image, so they follow that
+    image into the store rather than staying behind to caption the next game's
+    slots. Cosmetic, so nothing here is worth failing a launch over."""
+    try:
+        shots = list(STATE_SHOT_DIR.glob("state-slot-*.png"))
+        if not shots:
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        for shot in shots:
+            os.replace(shot, dest / shot.name)
+    except OSError as exc:
+        log.warning("state-shot: could not move the frames to %s: %s", dest, exc)
+
+
+def _take_state_shots_from(src: Path) -> None:
+    """Best-effort: put a stored disk's thumbnails back beside the live image.
+
+    The disk arriving carries the snapshots these frames picture, so the slots it
+    brings back have their captions again."""
+    if not src.is_dir():
+        return
+    try:
+        STATE_SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        for shot in src.glob("state-slot-*.png"):
+            os.replace(shot, STATE_SHOT_DIR / shot.name)
+        src.rmdir()
+    except OSError as exc:
+        log.warning("state-shot: could not take the frames from %s: %s", src, exc)
+
+
+def _same_contents(a: Path, b: Path) -> bool:
+    """Whether two images hold the same bytes. False when either cannot be read,
+    since an unreadable stock proves nothing about the disk in place."""
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def _hdd_key(rom_path: str) -> str:
+    """The name the disk image for `rom_path` is filed under.
+
+    The readable half is for whoever goes looking through the directory; the
+    digest is what actually tells two games apart, since sanitizing can map
+    different paths onto one name."""
+    digest = hashlib.sha256(rom_path.encode()).hexdigest()[:12]
+    stem = _HDD_KEY_UNSAFE.sub("_", Path(rom_path).stem)[:48].strip("._-")
+    return f"{stem or 'rom'}-{digest}.qcow2"
+
+
+def _hdd_owner() -> str | None:
+    """The name the live image is filed under, or None when that is unrecorded.
+
+    The record sits on a bind mount an operator can reach, and the name it holds
+    is used as a path inside the store, so anything a key would not have produced
+    counts as no record at all: a separator would reach out of the directory, and
+    a replacement character left by undecodable bytes would carry a NUL into a
+    path and raise where nothing expects it. Undecodable bytes are replaced
+    rather than raised because this runs on the launch path, and a corrupt record
+    must not take the launch thread down with it."""
+    try:
+        owner = (HDD_STORE / _HDD_OWNER_NAME).read_text(errors="replace").strip()
+    except OSError:
+        return None
+    if not owner:
+        return None
+    if owner == _HDD_OWNER_RESTORED:
+        return owner  # not a key, and never used as a path
+    if Path(owner).name != owner or _HDD_KEY_UNSAFE.search(owner):
+        log.warning("hdd: ignoring an owner record no key would have written: %r", owner)
+        return None
+    return owner
+
+
+def _set_hdd_owner(owner: str) -> None:
+    """Record whose disk is live.
+
+    Best-effort on purpose: a launch is not worth refusing over a record that
+    would not write. What it costs is the image its name, since the record then
+    still points at the game whose disk was just parked, which `_park_live_hdd`
+    catches by refusing to file two disks under one name."""
+    record = HDD_STORE / _HDD_OWNER_NAME
+    tmp = record.with_name(f".{record.name}.tmp")
+    try:
+        HDD_STORE.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(f"{owner}\n")
+        os.replace(tmp, record)
+    except OSError as exc:
+        log.warning("hdd: could not record %s as the live disk: %s", owner, exc)
+
+
+def _unclaimed_hdd_path() -> Path:
+    """A free name for a disk image whose game is unknown.
+
+    Only the upgrade to per-game images should reach this, since the shared disk
+    in place beforehand has no owner on record. Deleting it is not on the table:
+    it can hold the only copy of a save nobody ever pulled a state for."""
+    n = 1
+    while (candidate := HDD_STORE / f"unclaimed-{n}.qcow2").exists():
+        n += 1
+    return candidate
+
+
+def _park_live_hdd(owner: str | None) -> Path | None:
+    """Move the live image into the store under `owner`. Raises OSError.
+
+    Returns where it went, or None when there was nothing worth keeping, so a
+    caller whose swap then fails can put it back.
+
+    A rename rather than a copy: these images run to hundreds of MB, a launch
+    must not wait on that, and the live path has to come free for the disk
+    arriving in its place."""
+    if not _usable_qcow2(HDD_IMAGE):
+        return None  # nothing worth keeping, so the incoming disk takes the spot
+    if owner == _HDD_OWNER_RESTORED:
+        # A pushed archive that no launch ever claimed, now superseded by another
+        # push. RomM holds that archive, so there is nothing here worth a name.
+        return None
+    if owner is None and _same_contents(HDD_IMAGE, HDD_STOCK):
+        # An unowned disk identical to the stock is init.sh's first copy in a
+        # fresh container: no game ever wrote to it, so there is nothing to keep.
+        return None
+    HDD_STORE.mkdir(parents=True, exist_ok=True)
+    target = HDD_STORE / owner if owner else None
+    if target is not None and target.exists():
+        # That game's disk is already filed, so the record is stale and this is
+        # not that game's disk. Filing it here would destroy the disk that is.
+        log.warning("hdd: %s is already filed, so the owner record is stale", owner)
+        target = None
+    if target is None:
+        target = _unclaimed_hdd_path()
+        log.warning("hdd: filing the live disk as %s. No launch picks that up again: "
+                    "rename it to a game's own image to give it back", target)
+    os.replace(HDD_IMAGE, target)
+    log.info("hdd: parked the live disk as %s", target.name)
+    return target
+
+
+def _swap_live_hdd(owner: str | None, install: Callable[[], None]) -> None:
+    """Park the live image under `owner`, then `install` its replacement at
+    HDD_IMAGE. Raises OSError.
+
+    The state thumbnails go wherever the disk goes, since each pictures a
+    snapshot inside it. What `install` puts in place brings its own back, if it
+    has any: see `_take_state_shots_from`.
+
+    A failed install puts the parked image back. Leaving nothing at HDD_IMAGE
+    would boot xemu into its first-run wizard, and the owner record would still
+    name the game whose disk had just moved, so no later launch would see a swap
+    to do and the disk would sit in the store unreachable."""
+    parked = _park_live_hdd(owner)
+    if parked is not None:
+        _move_state_shots(_shot_store_for(parked))
+    else:
+        # The disk was not worth keeping, so neither are pictures of what was in it.
+        _delete_all_state_shots()
+    try:
+        install()
+    except OSError:
+        if parked is not None:
+            try:
+                os.replace(parked, HDD_IMAGE)
+                _take_state_shots_from(_shot_store_for(parked))
+                log.info("hdd: swap failed, put %s back in place", parked.name)
+            except OSError as exc:
+                log.error("hdd: swap failed and %s could not be put back: %s",
+                          parked.name, exc)
+        raise
+
+
+def _copy_stock_hdd() -> None:
+    """Lay down a fresh copy of the stock disk image. Raises OSError."""
+    tmp = HDD_IMAGE.parent / f".{HDD_IMAGE.name}.part"
+    try:
+        HDD_IMAGE.parent.mkdir(parents=True, exist_ok=True)
+        with HDD_STOCK.open("rb") as src, tmp.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.chown(tmp, _ABC_UID, _ABC_GID)
+        os.replace(tmp, HDD_IMAGE)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _hdd_swap_needed(rom_path: str) -> bool:
+    """Whether launching `rom_path` has to exchange the live image, which can
+    only be done with xemu stopped."""
+    return _hdd_owner() not in (_hdd_key(rom_path), _HDD_OWNER_RESTORED)
+
+
+def _prepare_hdd_for(rom_path: str) -> tuple[str | None, str | None]:
+    """Put the disk image belonging to `rom_path` in place.
+
+    Returns (fatal error, warning). A fatal error means there is no disk left to
+    boot and the launch has to stop, which only a swap whose rollback also failed
+    can produce. A warning means the launch goes ahead on a disk that is not this
+    game's, which is what every launch did before per-game images: reported
+    rather than silent, so a state archive coming back carrying another game is
+    not a mystery.
+
+    xemu has to be stopped already: QEMU holds the image open, and renaming it
+    away underneath would leave that process writing into the file just parked."""
+    key = _hdd_key(rom_path)
+    owner = _hdd_owner()
+    if owner == key:
+        return None, None
+    if owner == _HDD_OWNER_RESTORED:
+        # RomM pushed a state archive and is now launching the game it came from,
+        # so the live image already IS this game's disk. A restore that is never
+        # launched leaves the claim to whichever game launches next, which
+        # mislabels one image and loses none.
+        _set_hdd_owner(key)
+        return None, None
+
+    incoming = HDD_STORE / key
+    # Checked before anything moves: parking the live disk and only then finding
+    # nothing to put in its place would leave xemu with no disk at all. Nothing to
+    # swap in is not worth refusing a launch over.
+    if not _usable_qcow2(incoming) and not _usable_qcow2(HDD_STOCK):
+        return None, (f"this game has no hard disk image and {HDD_STOCK} is not a "
+                      "usable stock image, so it is running on the disk already "
+                      "mounted and its states will carry another game's data")
+    try:
+        if _usable_qcow2(incoming):
+            shots = _shot_store_for(incoming)
+            _swap_live_hdd(owner, lambda: os.replace(incoming, HDD_IMAGE))
+            _take_state_shots_from(shots)
+            log.info("hdd: swapped in %s", incoming.name)
+        else:
+            _swap_live_hdd(owner, _copy_stock_hdd)
+            log.info("hdd: %s has no disk yet, starting from the stock image", key)
+    except OSError as exc:
+        # The rollback normally puts the live disk back, which leaves this no worse
+        # than having no image to swap in: the game plays, on the wrong disk. A
+        # store on another filesystem lands here on every launch, so refusing
+        # would take the whole container down over a misconfiguration.
+        if _usable_qcow2(HDD_IMAGE):
+            return None, (f"could not swap in this game's hard disk image ({exc}), so "
+                          "it is running on the disk already mounted and its states "
+                          "will carry another game's data")
+        return f"could not swap the hard disk image and none is left in place: {exc}", None
+    _set_hdd_owner(key)
+    return None, None
+
+
 def _restore_hdd_image(content: bytes) -> str | None:
     """Replace the hard disk image with the one inside a pulled state archive.
 
@@ -1257,7 +1562,16 @@ def _restore_hdd_image(content: bytes) -> str | None:
             with zf.open(members[0]) as src, open(tmp, "wb") as dst:
                 shutil.copyfileobj(src, dst)
             os.chown(tmp, _ABC_UID, _ABC_GID)
-            os.replace(tmp, HDD_IMAGE)
+            if not _usable_qcow2(tmp):
+                # Checked before the live disk moves: a zip that passed every
+                # header check above can still hold something xemu cannot open,
+                # and parking a working disk to install that is a bad trade.
+                drop_tmp()
+                return "archive member is not a hard disk image xemu could open"
+            # The archive is about to take the live disk's place, and a resume is
+            # how players switch games: park the disk being displaced under its
+            # own name first or the game they are leaving loses it.
+            _swap_live_hdd(_hdd_owner(), lambda: os.replace(tmp, HDD_IMAGE))
         except (zipfile.BadZipFile, zlib.error, EOFError) as exc:
             # A CRC or deflate-stream mismatch only surfaces while decompressing,
             # long after the header checks above passed.
@@ -1266,9 +1580,12 @@ def _restore_hdd_image(content: bytes) -> str | None:
         except OSError as exc:
             drop_tmp()
             return f"could not write the hard disk image: {exc}"
-    # The frames describe snapshots in the image just replaced, so keeping them
-    # would caption the restored states with the previous session's pictures.
-    _delete_all_state_shots()
+    # The frames left with the disk they pictured, and the archive brought none of
+    # its own, so the restored states start uncaptioned: `_swap_live_hdd` handles
+    # that, which is why there is no wipe here.
+    # Which game this disk belongs to is only settled by the launch that follows,
+    # and RomM always launches the game the archive came from.
+    _set_hdd_owner(_HDD_OWNER_RESTORED)
     return None
 
 
@@ -1485,6 +1802,38 @@ def _do_load_rom(rom_path: str, load_slot: int | None = None,
                 generation = _state["session_generation"]
             _state["launch_error"] = None
             _state["resume_error"] = None
+            _state["hdd_error"] = None
+
+        # Every game plays off its own disk image, so a game the live disk does
+        # not belong to needs it exchanged first. That can only happen with xemu
+        # stopped: QEMU holds the image open, and renaming it away underneath
+        # would leave that process writing into the file just parked. Stopping it
+        # costs this launch the disc-inject shortcut below and cold-boots instead.
+        if _hdd_swap_needed(rom_path):
+            holds_disk = _qmp_available()
+            if holds_disk:
+                _kill_xemu()
+                holds_disk = _qmp_available()
+            if holds_disk:
+                # Something still has the disk open, so leave it where it is: the
+                # game boots off another game's disk exactly as it did before
+                # per-game images, which beats corrupting one.
+                warning = ("xemu did not let go of the hard disk image, so this game "
+                           "is running on the disk already mounted and its states "
+                           "will carry another game's data")
+            else:
+                error, warning = _prepare_hdd_for(rom_path)
+                if error is not None:
+                    log.error("hdd: %s", error)
+                    with _lock:
+                        if not _session_superseded(generation):
+                            _state["launch_error"] = error
+                    return
+            if warning is not None:
+                log.error("hdd: %s", warning)
+                with _lock:
+                    if not _session_superseded(generation):
+                        _state["hdd_error"] = warning
 
         # Reuse a live instance (disc inject + reset is much faster than a
         # cold boot); spawn one otherwise, with the disc already in the drive.
@@ -1970,6 +2319,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 started_at = _state["started_at"]
                 launch_error = _state["launch_error"]
                 resume_error = _state["resume_error"]
+                hdd_error = _state["hdd_error"]
                 setup = _state["setup"]
             self._send_json(200, {
                 "xemu_running": xemu_up,
@@ -1980,6 +2330,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "started_at": started_at,
                 "launch_error": launch_error,
                 "resume_error": resume_error,
+                "hdd_error": hdd_error,
             })
             return
 
@@ -2087,6 +2438,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 _state["launch_in_progress"] = True
                 _state["launch_error"] = None
                 _state["resume_error"] = None
+                _state["hdd_error"] = None
                 generation = _state["session_generation"]
             Thread(target=_do_setup, args=(generation,), daemon=True).start()
             self._send_json(200, {"status": "starting setup", "timeout": SETUP_TIMEOUT})
@@ -2223,6 +2575,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         # reporting errors from it — same as DELETE /launch.
                         _state["launch_error"] = None
                         _state["resume_error"] = None
+                        _state["hdd_error"] = None
                 # Kill rather than return to the dashboard: an idle xemu
                 # busy-loops several CPU cores under software rendering.
                 _kill_xemu()
@@ -2434,6 +2787,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 # /status must not keep reporting them afterwards.
                 _state["launch_error"] = None
                 _state["resume_error"] = None
+                _state["hdd_error"] = None
             log.info("Session ended via DELETE /launch — xemu stopped")
             self._send_json(200, {"status": "ok"})
             return

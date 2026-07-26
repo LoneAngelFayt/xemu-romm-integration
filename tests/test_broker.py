@@ -30,8 +30,16 @@ import broker  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _reset_state():
-    """Each test starts clean and leaves no armed timer behind."""
+def _reset_state(tmp_path, monkeypatch):
+    """Each test starts clean and leaves no armed timer behind.
+
+    The per-game disk store and the stock image are redirected into the test's own
+    directory for every test, not just the ones about them: the launch path reads
+    the store on its way through, and none of this may reach the real /config.
+    Neither path is created, which is the state a container is in before its first
+    swap."""
+    monkeypatch.setattr(broker, "HDD_STORE", tmp_path / "hdd-store")
+    monkeypatch.setattr(broker, "HDD_STOCK", tmp_path / "stock" / "xbox_hdd.qcow2")
     broker._cancel_setup_watchdog()
     with broker._lock:
         broker._state.update({
@@ -45,6 +53,7 @@ def _reset_state():
             "state_file_reading": False,
             "launch_error": None,
             "resume_error": None,
+            "hdd_error": None,
             "setup": False,
             "setup_timer": None,
             "session_generation": 0,
@@ -178,6 +187,15 @@ def test_do_setup_qmp_timeout_spares_a_reused_instance(monkeypatch):
 # ── ROM launch path ───────────────────────────────────────────────────────────
 
 
+def _own_live_disk(rom_path):
+    """Record the live disk as this game's.
+
+    Now that every game plays off its own image, this is the only way a running
+    xemu can be reused: a game the live disk does not belong to has to have it
+    swapped, and that means stopping xemu first."""
+    broker._set_hdd_owner(broker._hdd_key(rom_path))
+
+
 def test_launch_xemu_puts_the_disc_in_the_drive_at_power_on(monkeypatch, tmp_path):
     argv = []
 
@@ -229,9 +247,10 @@ def test_do_load_rom_qmp_timeout_spares_a_reused_instance(monkeypatch):
     )
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    _own_live_disk("/romm/library/x.iso")
     with broker._lock:
         broker._state["launch_in_progress"] = True
-        broker._state["rom_path"] = "/romm/library/someone-elses.iso"
+        broker._state["rom_path"] = "/romm/library/x.iso"
     broker._do_load_rom("/romm/library/x.iso")
     assert calls == []  # the running game survives
     with broker._lock:
@@ -283,9 +302,10 @@ def test_do_load_rom_failed_load_spares_a_reused_instance(monkeypatch):
     monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
     monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: False)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: calls.append("kill"))
+    _own_live_disk("/romm/library/x.iso")
     with broker._lock:
         broker._state["launch_in_progress"] = True
-        broker._state["rom_path"] = "/romm/library/someone-elses.iso"
+        broker._state["rom_path"] = "/romm/library/x.iso"
     broker._do_load_rom("/romm/library/x.iso")
     assert calls == []
     with broker._lock:
@@ -948,7 +968,41 @@ def _zip_bytes(members, compression=zipfile.ZIP_DEFLATED):
     return buf.getvalue()
 
 
-def _state_archive(data=b"restored image"):
+_TAG_AT = 80  # where _disk_bytes puts its tag: past the header and the L1 table
+
+
+def _disk_bytes(tag=b""):
+    """A qcow2 the broker would accept, tagged so a test can tell which copy it is
+    looking at. A whole header and an L1 table inside the file is all the broker
+    checks, not the rest of the structure."""
+    head = bytearray(72)
+    head[0:4] = b"QFI\xfb"
+    head[4:8] = (3).to_bytes(4, "big")        # version
+    head[20:24] = (16).to_bytes(4, "big")     # cluster_bits
+    head[36:40] = (1).to_bytes(4, "big")      # l1_size
+    head[40:48] = (72).to_bytes(8, "big")     # l1_table_offset
+    return bytes(head) + b"\0" * 8 + tag
+
+
+def _disk(path, tag=b""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_disk_bytes(tag))
+    return path
+
+
+def _tag(path):
+    """Which tagged image is sitting at `path`."""
+    return path.read_bytes()[_TAG_AT:]
+
+
+def _state_archive(tag=b"restored"):
+    """A pushable archive whose member is a disk image xemu could open, which is
+    what RomM sends and what the restore path insists on."""
+    return _zip_bytes([(broker.HDD_IMAGE_ENTRY, _disk_bytes(tag))])
+
+
+def _raw_state_archive(data):
+    """An archive whose member is whatever the test says, image or not."""
     return _zip_bytes([(broker.HDD_IMAGE_ENTRY, data)])
 
 
@@ -981,9 +1035,8 @@ def test_zip_hdd_image_returns_none_when_missing(hdd):
 
 
 def test_restore_hdd_image_round_trip(hdd):
-    payload = b"a new disk image" * 64
-    assert broker._restore_hdd_image(_state_archive(payload)) is None
-    assert hdd.read_bytes() == payload
+    assert broker._restore_hdd_image(_state_archive(b"a new disk image")) is None
+    assert _tag(hdd) == b"a new disk image"
     assert not _tmp_image(hdd).exists()
 
 
@@ -993,7 +1046,7 @@ def test_restore_hdd_image_creates_missing_parent(tmp_path, monkeypatch):
     monkeypatch.setattr(broker, "_ABC_UID", os.getuid())
     monkeypatch.setattr(broker, "_ABC_GID", os.getgid())
     assert broker._restore_hdd_image(_state_archive(b"seed")) is None
-    assert path.read_bytes() == b"seed"
+    assert _tag(path) == b"seed"
 
 
 def test_restore_hdd_image_rejects_non_zip(hdd):
@@ -1019,7 +1072,7 @@ def test_restore_hdd_image_rejects_extra_members(hdd):
 def test_restore_hdd_image_rejects_oversized_member(hdd, monkeypatch):
     # Declared (uncompressed) size is what matters: the archive itself is tiny.
     monkeypatch.setattr(broker, "HDD_IMAGE_MAX_BYTES", 128)
-    error = broker._restore_hdd_image(_state_archive(b"\0" * 4096))
+    error = broker._restore_hdd_image(_raw_state_archive(b"\0" * 4096))
     assert error == "archive exceeds size limit when extracted"
     assert hdd.read_bytes() == b"original image"
     assert not _tmp_image(hdd).exists()
@@ -1030,6 +1083,439 @@ def test_restore_hdd_image_rejects_corrupt_member(hdd):
     assert error and "corrupt" in error
     assert hdd.read_bytes() == b"original image"
     assert not _tmp_image(hdd).exists()  # the aborted copy is not left behind
+
+
+# ── Per-game disk images ──────────────────────────────────────────────────────
+
+_FABLE = "/romm/library/Fable.iso"
+_HALO = "/romm/library/Halo.iso"
+
+
+@pytest.fixture
+def store(hdd):
+    """A stock image on disk and a live disk xemu would open, which is a container
+    that has booted at least one game."""
+    _disk(broker.HDD_STOCK, b"stock")
+    _disk(hdd, b"live")
+    return broker.HDD_STORE
+
+
+def _stored(rom_path):
+    return broker.HDD_STORE / broker._hdd_key(rom_path)
+
+
+def test_hdd_key_is_stable_and_tells_two_games_apart():
+    assert broker._hdd_key(_HALO) == broker._hdd_key(_HALO)
+    assert broker._hdd_key(_HALO) != broker._hdd_key(_FABLE)
+
+
+def test_hdd_key_separates_two_copies_of_one_title():
+    """Sanitizing maps different paths onto one readable name, so the digest is
+    what actually has to keep their disks apart."""
+    us = broker._hdd_key("/romm/library/us/Halo (USA).iso")
+    eu = broker._hdd_key("/romm/library/eu/Halo (USA).iso")
+    assert us != eu
+    assert us.startswith("Halo_USA-") and eu.startswith("Halo_USA-")
+
+
+def test_hdd_key_still_names_a_rom_whose_title_sanitizes_away():
+    assert broker._hdd_key("/romm/library/日本語.iso").startswith("rom-")
+
+
+def test_usable_qcow2_takes_only_a_file_xemu_could_open(tmp_path):
+    assert not broker._usable_qcow2(tmp_path / "absent.qcow2")
+    (tmp_path / "empty.qcow2").write_bytes(b"")
+    assert not broker._usable_qcow2(tmp_path / "empty.qcow2")
+    (tmp_path / "headerless.qcow2").write_bytes(b"not an image at all")
+    assert not broker._usable_qcow2(tmp_path / "headerless.qcow2")
+    assert broker._usable_qcow2(_disk(tmp_path / "real.qcow2"))
+
+
+def test_usable_qcow2_rejects_an_image_that_stops_before_its_l1_table(tmp_path):
+    """An interrupted copy keeps the header it already wrote, so the magic alone
+    says nothing: what gives it away is a file too short for the tables that
+    header points at."""
+    path = tmp_path / "half.qcow2"
+    path.write_bytes(_disk_bytes()[:74])
+    assert path.read_bytes()[:4] == b"QFI\xfb"  # the magic survived the truncation
+    assert not broker._usable_qcow2(path)
+
+
+def test_hdd_owner_ignores_a_record_that_is_not_a_plain_name(store):
+    """The record sits on a bind mount an operator can reach, and the name goes
+    straight into a path, so it must not be able to point out of the store."""
+    broker.HDD_STORE.mkdir(parents=True, exist_ok=True)
+    (broker.HDD_STORE / broker._HDD_OWNER_NAME).write_text("../../escaped.qcow2\n")
+    assert broker._hdd_owner() is None
+
+
+def test_hdd_owner_discards_a_record_that_is_not_text(store):
+    """Undecodable bytes read back as replacement characters, which would carry a
+    NUL into a path. This runs on the launch path, so it must come back as no
+    record rather than take the launch thread down."""
+    broker.HDD_STORE.mkdir(parents=True, exist_ok=True)
+    (broker.HDD_STORE / broker._HDD_OWNER_NAME).write_bytes(b"\xff\xfe\x00binary")
+    assert broker._hdd_owner() is None
+
+
+def test_a_new_game_parks_the_outgoing_disk_and_starts_from_stock(store, hdd):
+    """The whole point: a 50MB MechAssault state came back at 590MB once two Fable
+    sessions had written to the same shared disk."""
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(_stored(_FABLE)) == b"live"
+    assert _tag(hdd) == b"stock"
+    assert broker._hdd_owner() == broker._hdd_key(_HALO)
+
+
+def test_a_returning_game_gets_its_own_disk_back(store, hdd):
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    _disk(_stored(_HALO), b"halo saves")
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(hdd) == b"halo saves"
+    assert _tag(_stored(_FABLE)) == b"live"
+    assert not _stored(_HALO).exists()  # moved in, not copied
+
+
+def test_relaunching_the_same_game_leaves_its_disk_where_it_is(store, hdd):
+    broker._set_hdd_owner(broker._hdd_key(_HALO))
+    assert not broker._hdd_swap_needed(_HALO)
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(hdd) == b"live"
+    assert list(store.glob("*.qcow2")) == []
+
+
+def test_a_restored_disk_is_claimed_by_the_launch_that_follows(store, hdd):
+    """The resume path: RomM pushes a state archive and then launches the game it
+    came from. Swapping here would throw that disk away and boot the stock one,
+    which is every resume broken."""
+    broker._set_hdd_owner(broker._HDD_OWNER_RESTORED)
+    assert not broker._hdd_swap_needed(_HALO)
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(hdd) == b"live"
+    assert broker._hdd_owner() == broker._hdd_key(_HALO)
+    assert list(store.glob("*.qcow2")) == []
+
+
+def test_a_swap_takes_the_state_shots_off_this_game_s_slots(store, shots):
+    """The frames picture snapshots inside the disk just parked, so leaving them
+    behind captions this game's slots with the previous game's pictures."""
+    shots.mkdir()
+    broker._state_shot_path(3).write_bytes(b"a frame from Fable")
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert list(shots.glob("*.png")) == []
+
+
+def test_a_returning_game_gets_its_state_shots_back_with_its_disk(store, hdd, shots):
+    """The snapshots come back with the disk, so their thumbnails have to as well
+    or every slot the player left behind shows up blank."""
+    shots.mkdir()
+    broker._state_shot_path(3).write_bytes(b"a frame from Fable")
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    _disk(_stored(_HALO), b"halo saves")
+    halo_shot = broker._shot_store_for(_stored(_HALO)) / "state-slot-7.png"
+    halo_shot.parent.mkdir(parents=True)
+    halo_shot.write_bytes(b"a frame from Halo")
+
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert broker._state_shot_path(7).read_bytes() == b"a frame from Halo"
+    assert not broker._state_shot_path(3).exists()
+    # Fable's frame followed Fable's disk into the store.
+    parked = broker._shot_store_for(_stored(_FABLE))
+    assert (parked / "state-slot-3.png").read_bytes() == b"a frame from Fable"
+    assert not halo_shot.parent.exists()  # emptied, so it does not accumulate
+
+
+def test_an_undone_swap_puts_the_state_shots_back_too(store, hdd, shots):
+    """The disk went back, so the frames that picture it have to follow or the
+    slots still on that disk look empty."""
+    shots.mkdir()
+    broker._state_shot_path(3).write_bytes(b"a frame from Fable")
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    incoming = _disk(_stored(_HALO), b"halo saves")
+    real_replace = broker.os.replace
+
+    def _fail_to_install(src, dst):
+        if Path(src) == incoming:
+            raise OSError("no space left on device")
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(broker.os, "replace", _fail_to_install)
+        assert broker._prepare_hdd_for(_HALO)[1] is not None
+    assert broker._state_shot_path(3).read_bytes() == b"a frame from Fable"
+
+
+def test_restore_parks_the_outgoing_game_disk_before_overwriting_it(store, hdd):
+    """A resume is how players switch games, so the disk being displaced has to be
+    filed under its own name or the game they are leaving loses it."""
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    assert broker._restore_hdd_image(_state_archive(b"restored")) is None
+    assert _tag(hdd) == b"restored"
+    assert _tag(_stored(_FABLE)) == b"live"
+    assert broker._hdd_owner() == broker._HDD_OWNER_RESTORED
+
+
+def test_a_restore_of_something_xemu_cannot_open_keeps_the_live_disk(store, hdd):
+    """The zip checks all passed and the member is the right name and size, so this
+    is the last chance to notice: parking a working disk to install an image xemu
+    would answer with its first-run wizard is a bad trade."""
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    error = broker._restore_hdd_image(_raw_state_archive(b"not an image at all"))
+    assert error and "xemu could open" in error
+    assert _tag(hdd) == b"live"
+    assert list(store.glob("*.qcow2")) == []
+    assert broker._hdd_owner() == broker._hdd_key(_FABLE)
+    assert not _tmp_image(hdd).exists()
+
+
+def test_a_restore_replacing_an_unclaimed_restore_files_nothing(store, hdd):
+    """An archive no launch ever claimed is RomM's, and RomM still holds it, so
+    there is nothing here worth a name."""
+    broker._set_hdd_owner(broker._HDD_OWNER_RESTORED)
+    assert broker._restore_hdd_image(_state_archive(b"second")) is None
+    assert _tag(hdd) == b"second"
+    assert sorted(p.name for p in store.iterdir()) == ["current"]
+
+
+def test_the_disk_from_before_the_upgrade_is_kept_not_thrown_away(store, hdd):
+    """No owner on record means a container that predates per-game images. That
+    shared disk can hold the only copy of a save nobody pulled a state for."""
+    assert broker._hdd_owner() is None
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(store / "unclaimed-1.qcow2") == b"live"
+    assert _tag(hdd) == b"stock"
+
+
+def test_a_fresh_container_does_not_file_its_untouched_stock_copy(store, hdd):
+    """An unowned disk identical to the stock is init.sh's first copy: no game ever
+    wrote to it, so parking it would litter the store on every new deployment."""
+    hdd.write_bytes(broker.HDD_STOCK.read_bytes())
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert list(store.glob("*.qcow2")) == []
+
+
+def test_a_second_unowned_disk_does_not_overwrite_the_first(store, hdd):
+    _disk(store / "unclaimed-1.qcow2", b"kept from an earlier upgrade")
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(store / "unclaimed-1.qcow2") == b"kept from an earlier upgrade"
+    assert _tag(store / "unclaimed-2.qcow2") == b"live"
+
+
+def test_a_stale_owner_record_does_not_cost_the_named_game_its_disk(store, hdd):
+    """The record is written best-effort, so it can name a game whose disk is
+    already filed. Filing this one on top would destroy the one that is."""
+    _disk(_stored(_FABLE), b"fable saves")
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))  # stale: the live disk is not Fable's
+    assert broker._prepare_hdd_for(_HALO) == (None, None)
+    assert _tag(_stored(_FABLE)) == b"fable saves"
+    assert _tag(store / "unclaimed-1.qcow2") == b"live"
+    assert _tag(hdd) == b"stock"
+
+
+def test_nothing_to_swap_in_launches_on_the_disk_already_mounted(store, hdd):
+    """Refusing the launch would be worse: a missing stock image is a broken
+    install, and booting another game's disk is what happened before anyway."""
+    broker.HDD_STOCK.unlink()
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    error, warning = broker._prepare_hdd_for(_HALO)
+    assert error is None
+    assert warning and "another game's data" in warning
+    assert _tag(hdd) == b"live"
+    assert list(store.glob("*.qcow2")) == []
+    # Still Fable's disk, because that is whose writes are on it.
+    assert broker._hdd_owner() == broker._hdd_key(_FABLE)
+
+
+def test_a_truncated_stock_image_counts_as_no_stock_at_all(store, hdd):
+    broker.HDD_STOCK.write_bytes(_disk_bytes()[:40])
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    error, warning = broker._prepare_hdd_for(_HALO)
+    assert error is None and warning is not None
+    assert _tag(hdd) == b"live"
+
+
+def test_a_failed_swap_puts_the_parked_disk_back_and_plays_on(store, hdd):
+    """Leaving nothing at HDD_IMAGE boots xemu into its first-run wizard, and the
+    owner record would still name the game whose disk had just moved, so no later
+    launch would see a swap to do and that disk would be unreachable. With the
+    disk back the launch is no worse off than having nothing to swap in, so it is
+    a warning: a store on another filesystem fails this way on every launch, and
+    refusing would take the container down over a misconfiguration."""
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    incoming = _disk(_stored(_HALO), b"halo saves")
+    real_replace = broker.os.replace
+
+    def _fail_to_install(src, dst):
+        """Only the move that brings the new disk in fails, so the rollback that
+        follows it still goes through."""
+        if Path(src) == incoming:
+            raise OSError("no space left on device")
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(broker.os, "replace", _fail_to_install)
+        error, warning = broker._prepare_hdd_for(_HALO)
+    assert error is None
+    assert warning and "another game's data" in warning
+    assert _tag(hdd) == b"live"  # back where it was
+    assert not _stored(_FABLE).exists()
+    assert broker._hdd_owner() == broker._hdd_key(_FABLE)
+
+
+def test_a_failed_restore_puts_the_parked_disk_back(store, hdd):
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    tmp = _tmp_image(hdd)
+    real_replace = broker.os.replace
+
+    def _fail_to_install(src, dst):
+        if Path(src) == tmp:
+            raise OSError("no space left on device")
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(broker.os, "replace", _fail_to_install)
+        error = broker._restore_hdd_image(_state_archive(b"restored"))
+    assert error and "could not write" in error
+    assert _tag(hdd) == b"live"
+    assert not _stored(_FABLE).exists()
+    assert broker._hdd_owner() == broker._hdd_key(_FABLE)
+
+
+def test_a_failed_swap_that_cannot_be_undone_refuses_the_launch(store, hdd, caplog):
+    """The park succeeded and the rollback did not, so there is no disk left to
+    boot: this is the one case worth stopping a launch over, and the name the disk
+    was filed under is the only thing that can recover it."""
+    broker._set_hdd_owner(broker._hdd_key(_FABLE))
+    real_replace = broker.os.replace
+
+    def _one_way(src, dst):
+        if Path(dst) == hdd:
+            raise OSError("no space left on device")
+        return real_replace(src, dst)
+
+    with pytest.MonkeyPatch.context() as mp, caplog.at_level(logging.ERROR):
+        mp.setattr(broker.os, "replace", _one_way)
+        error, warning = broker._prepare_hdd_for(_HALO)
+    assert error and "none is left in place" in error
+    assert warning is None
+    assert not hdd.exists()  # the rollback went through the same failing move
+    assert any(broker._hdd_key(_FABLE) in r.getMessage() for r in caplog.records)
+
+
+def test_do_load_rom_stops_a_live_xemu_before_swapping_the_disk(monkeypatch):
+    """QEMU holds the image open, so renaming it away underneath would leave that
+    process writing into the file just parked."""
+    events = []
+
+    def _swap(rom_path):
+        events.append("swap")
+        return None, None
+
+    # Live until the kill lands, which is what lets the swap go ahead.
+    monkeypatch.setattr(broker, "_qmp_available", lambda: not events)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: events.append("kill"))
+    monkeypatch.setattr(broker, "_prepare_hdd_for", _swap)
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: events.append("boot") or True)
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(
+        broker, "_qmp_load_rom", lambda p: pytest.fail("a cold start must not be reset")
+    )
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom(_HALO)
+    # Stopped, swapped, then cold-booted: the disc-inject shortcut is not available
+    # to a launch that had to exchange the disk.
+    assert events == ["kill", "swap", "boot"]
+    with broker._lock:
+        assert broker._state["hdd_error"] is None
+
+
+def test_do_load_rom_does_not_stop_xemu_when_the_disk_already_fits(monkeypatch):
+    monkeypatch.setattr(broker, "_qmp_available", lambda: True)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: pytest.fail("nothing to swap"))
+    monkeypatch.setattr(
+        broker, "_prepare_hdd_for", lambda p: pytest.fail("nothing to swap")
+    )
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: True)
+    _own_live_disk(_HALO)
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom(_HALO)
+    with broker._lock:
+        assert broker._state["launch_error"] is None
+        assert broker._state["hdd_error"] is None
+
+
+def test_do_load_rom_reports_a_launch_that_ran_on_the_wrong_disk(monkeypatch):
+    """Silent degradation is what makes a fat state archive a mystery, so /status
+    has to carry it."""
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+    monkeypatch.setattr(broker, "_prepare_hdd_for", lambda p: (None, "no disk of its own"))
+    monkeypatch.setattr(broker, "_launch_xemu", lambda rom=None: True)
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom(_HALO)
+    with broker._lock:
+        assert broker._state["hdd_error"] == "no disk of its own"
+        assert broker._state["launch_error"] is None  # the game did launch
+        assert broker._state["rom_path"] == _HALO
+
+
+def test_do_load_rom_keeps_the_mounted_disk_when_the_stop_does_not_take(monkeypatch):
+    """Something still has the image open, so the game boots off the disk in place
+    rather than risking a swap under a live QEMU."""
+    monkeypatch.setattr(broker, "_qmp_available", lambda: True)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+    monkeypatch.setattr(
+        broker, "_prepare_hdd_for", lambda p: pytest.fail("xemu still holds the disk")
+    )
+    monkeypatch.setattr(broker, "_qmp_wait_ready", lambda t: True)
+    monkeypatch.setattr(broker, "_qmp_load_rom", lambda p: True)
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom(_HALO)
+    with broker._lock:
+        assert broker._state["rom_path"] == _HALO
+        assert broker._state["launch_error"] is None
+        assert "did not let go" in broker._state["hdd_error"]
+
+
+def test_do_load_rom_reports_a_swap_failure_instead_of_booting_a_lost_disk(monkeypatch):
+    monkeypatch.setattr(broker, "_qmp_available", lambda: False)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+    monkeypatch.setattr(
+        broker, "_prepare_hdd_for", lambda p: ("could not swap the disk", None)
+    )
+    monkeypatch.setattr(
+        broker, "_launch_xemu", lambda rom=None: pytest.fail("there is no disk to boot")
+    )
+    with broker._lock:
+        broker._state["launch_in_progress"] = True
+    broker._do_load_rom(_HALO)
+    with broker._lock:
+        assert broker._state["launch_error"] == "could not swap the disk"
+        assert broker._state["launch_in_progress"] is False
+
+
+def test_status_reports_a_wrong_disk_launch(client):
+    with broker._lock:
+        broker._state["hdd_error"] = "running on another game's disk"
+    assert _status(client)["hdd_error"] == "running on another game's disk"
+
+
+def test_status_clears_the_wrong_disk_report_when_the_session_ends(client):
+    """A report about the previous game's disk must not follow the next session
+    around, the same way launch_error and resume_error do not."""
+    with broker._lock:
+        broker._state["hdd_error"] = "running on another game's disk"
+        broker._state["rom_path"] = _HALO
+    assert _req(client, "DELETE", "/launch")[0] == 200
+    assert _status(client)["hdd_error"] is None
 
 
 # ── /state-file HTTP contract ─────────────────────────────────────────────────
@@ -1230,7 +1716,7 @@ def test_put_state_file_restores_image(restore_client, hdd):
     )
     assert code == 200
     assert json.loads(body)["filename"] == "Halo.x03"
-    assert hdd.read_bytes() == payload
+    assert _tag(hdd) == payload
     assert _wait_state_file_idle()
 
 
@@ -2097,10 +2583,7 @@ def test_restore_clears_every_frame(shots, hdd):
     shots.mkdir()
     for slot in (1, 7):
         (shots / f"state-slot-{slot}.png").write_bytes(b"old session")
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr(broker.HDD_IMAGE_ENTRY, b"restored image")
-    assert broker._restore_hdd_image(buf.getvalue()) is None
+    assert broker._restore_hdd_image(_state_archive()) is None
     assert list(shots.glob("state-slot-*.png")) == []
 
 
@@ -2643,7 +3126,7 @@ def test_stalled_body_gives_the_state_file_flag_back(restore_client, hdd, monkey
             _state_archive(b"pushed"),
         )
         assert code == 200
-        assert hdd.read_bytes() == b"pushed"
+        assert _tag(hdd) == b"pushed"
     finally:
         _drain_stalled(sock)
 
@@ -2715,7 +3198,7 @@ def test_a_body_that_arrives_in_pieces_still_lands(restore_client, hdd):
     finally:
         sock.close()
     assert _wait_state_file_idle()
-    assert hdd.read_bytes() == b"pushed"
+    assert _tag(hdd) == b"pushed"
 
 
 def test_handler_has_a_request_timeout():
@@ -2928,7 +3411,7 @@ def test_put_state_file_requires_the_secret(secret_client, hdd, monkeypatch):
     assert _raw_req(secret_client, "PUT", path, payload, secret="wrong")[0] == 403
     assert hdd.read_bytes() == b"original image"  # nothing was written
     assert _raw_req(secret_client, "PUT", path, payload, secret=_SECRET)[0] == 200
-    assert hdd.read_bytes() == b"pushed disk image"
+    assert _tag(hdd) == b"pushed disk image"
 
 
 def test_correct_secret_reaches_the_endpoint(secret_client, rom_root, monkeypatch):
