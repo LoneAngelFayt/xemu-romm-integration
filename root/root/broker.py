@@ -144,9 +144,39 @@ _LD_PRELOAD = (
     or "/usr/lib/selkies_joystick_interposer.so:/opt/lib/libudev.so.1.0.0-fake"
 )
 
+# sudo's default env_reset drops everything the container was started with, so
+# only the names spelled out on the `env` line survive the hop. Every renderer
+# knob an operator sets in docker-compose — VK_DRIVER_FILES,
+# __GLX_VENDOR_LIBRARY_NAME, MESA_VK_DEVICE_SELECT — was silently discarded
+# before it could take effect. Forward the vendor namespaces wholesale rather
+# than an exact list so a knob we haven't heard of still arrives.
+_GPU_ENV_PREFIXES = (
+    "NVIDIA_", "VK_", "MESA_", "LIBGL_", "GALLIUM_", "RADV_", "AMD_",
+    "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
+)
+# XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
+# icd.d/ — dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# linuxserver base image's render-node selector, which misses the DRI_ prefix.
+_GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
+
+
+def _gpu_env() -> dict[str, str]:
+    """Graphics-related variables inherited from the container environment.
+
+    Empty values are skipped: `env VAR=` sets the variable to the empty string,
+    which for the likes of LIBGL_ALWAYS_SOFTWARE reads as set-and-false to some
+    consumers and set-and-true to others."""
+    return {
+        k: v for k, v in os.environ.items()
+        if v and (k.startswith(_GPU_ENV_PREFIXES) or k in _GPU_ENV_NAMES)
+    }
+
+
 # Session environment xemu previously inherited from the desktop autostart;
 # now that the broker spawns it, replicated here for sudo -u abc env.
 ENV = {
+    # Inherited GPU vars come first so the explicit entries below always win.
+    **_gpu_env(),
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     "LD_PRELOAD":         _LD_PRELOAD,
@@ -169,6 +199,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Report the forwarded GPU environment at startup. Renderer complaints almost
+# always begin with "my env vars aren't taking effect", and this line answers
+# that question from the broker log without a shell in the container.
+_forwarded_gpu = sorted(_gpu_env())
+if _forwarded_gpu:
+    log.info("Forwarding GPU environment to xemu: %s", ", ".join(_forwarded_gpu))
+else:
+    log.info(
+        "No GPU environment variables found to forward. If the renderer falls back to "
+        "llvmpipe, run `vulkaninfo --summary` in the container: NVIDIA absent means the "
+        "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
+        "NVIDIA present means the failure is at surface creation instead."
+    )
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
