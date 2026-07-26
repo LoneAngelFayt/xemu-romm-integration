@@ -2565,6 +2565,26 @@ def _stalled_request(base, method, path, secret=None):
     return sock
 
 
+def _recv_response(sock, timeout=5.0):
+    """Read a whole response off a raw socket.
+
+    One recv is not a response: the handler flushes its headers and its body as
+    two separate unbuffered sends, and on loopback the first recv comes back
+    with the headers alone roughly four times out of five. Every reply here is
+    HTTP/1.0, so the server closing is the end of the body."""
+    sock.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _drain_stalled(sock):
     """Half-close and read the handler out, so it is not left writing a
     response into a socket the test already closed."""
@@ -2670,8 +2690,7 @@ def test_trickling_body_cannot_outlast_the_transfer_budget(restore_client, monke
         assert _wait_state_file_idle()
         stop.set()
         dribbler.join(2)
-        sock.settimeout(5)
-        assert b" 408 " in sock.recv(4096)
+        assert b" 408 " in _recv_response(sock)
     finally:
         stop.set()
         _drain_stalled(sock)
@@ -2692,8 +2711,7 @@ def test_a_body_that_arrives_in_pieces_still_lands(restore_client, hdd):
         for i in range(0, len(archive), 64):
             sock.sendall(archive[i:i + 64])
             time.sleep(0.005)
-        sock.settimeout(10)
-        assert b" 200 " in sock.recv(4096)
+        assert b" 200 " in _recv_response(sock, timeout=10)
     finally:
         sock.close()
     assert _wait_state_file_idle()
@@ -2808,8 +2826,7 @@ def test_unusable_content_length_is_refused_as_such(client, value):
             "Host: 127.0.0.1\r\n"
             f"Content-Length: {value}\r\n\r\n"
         ).encode())
-        sock.settimeout(5)
-        response = sock.recv(4096)
+        response = _recv_response(sock)
     finally:
         sock.close()
     head, _, payload = response.partition(b"\r\n\r\n")
