@@ -100,6 +100,11 @@ STOP_WAIT = float(os.environ.get("STOP_WAIT", "5.0"))
 REQUEST_TIMEOUT = float(os.environ.get("BROKER_REQUEST_TIMEOUT", "60.0"))
 PACTL_TIMEOUT = float(os.environ.get("PACTL_TIMEOUT", "5.0"))
 
+# Floor for the shutdown drain. QMP_WAIT can be tuned below the time a snapshot
+# job needs to conclude, and draining for less than a job takes defeats the
+# point of draining at all.
+SHUTDOWN_DRAIN_MIN = float(os.environ.get("SHUTDOWN_DRAIN_MIN", "5.0"))
+
 # Every JSON body this broker accepts is a handful of fields; anything larger is
 # a mistake or an attempt to make a handler thread hold 64 KiB and up.
 JSON_BODY_MAX_BYTES = int(os.environ.get("JSON_BODY_MAX_BYTES", str(64 * 1024)))
@@ -1754,9 +1759,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
+            length = -1
+        # A negative length is not "no body": the peer announced one and the
+        # header is nonsense, so say so rather than answer for a missing field.
+        if length < 0:
             self._send_json(400, {"error": "invalid Content-Length"})
             return None
-        if length <= 0:
+        if length == 0:
             return {}
         if length > JSON_BODY_MAX_BYTES:
             self._send_json(413, {"error": "request body too large"})
@@ -2444,7 +2453,7 @@ def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
 
     # Both flags, exactly as DELETE /launch waits on them: a half-written
     # snapshot and a /state-file read cut mid-zip are equally unusable.
-    wait = max(QMP_WAIT, 5.0)
+    wait = max(QMP_WAIT, SHUTDOWN_DRAIN_MIN)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         with _lock:

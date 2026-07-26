@@ -8,6 +8,7 @@ server, with the process/QMP helpers mocked out.
 import base64
 import io
 import json
+import logging
 import os
 import socket
 import struct
@@ -2733,9 +2734,10 @@ def test_graceful_shutdown_waits_for_a_state_file_read(monkeypatch):
     assert killed and killed[0] >= release_at
 
 
-def test_graceful_shutdown_gives_up_on_a_flag_that_never_clears(monkeypatch):
-    """The stop still wins: a wedged transfer must not block the restart."""
-    monkeypatch.setattr(broker, "QMP_WAIT", 0.1)
+def test_graceful_shutdown_gives_up_on_a_flag_that_never_clears(monkeypatch, caplog):
+    """The stop still wins: a wedged transfer must not hold up the restart."""
+    monkeypatch.setattr(broker, "QMP_WAIT", 0.2)
+    monkeypatch.setattr(broker, "SHUTDOWN_DRAIN_MIN", 0.2)
     monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
 
     class _Server:
@@ -2745,9 +2747,40 @@ def test_graceful_shutdown_gives_up_on_a_flag_that_never_clears(monkeypatch):
     with broker._lock:
         broker._state["state_file_in_progress"] = True
     started = time.monotonic()
-    broker._graceful_shutdown(_Server(), 15)
-    # wait is floored at 5s, so this only proves it is bounded, not prompt.
-    assert time.monotonic() - started < 15
+    with caplog.at_level(logging.WARNING, logger=broker.log.name):
+        broker._graceful_shutdown(_Server(), 15)
+    elapsed = time.monotonic() - started
+    assert 0.2 <= elapsed < 2.0  # waited the budget, then stopped waiting
+    assert "did not conclude" in caplog.text
+
+
+def test_shutdown_drain_has_a_floor_under_a_tuned_down_qmp_wait(monkeypatch):
+    """A QMP_WAIT below what a snapshot job needs would drain for less than the
+    job takes, which is the same as not draining."""
+    monkeypatch.setattr(broker, "QMP_WAIT", 0.01)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+    assert broker.SHUTDOWN_DRAIN_MIN >= 5.0
+
+    class _Server:
+        def shutdown(self):
+            pass
+
+    with broker._lock:
+        broker._state["state_file_in_progress"] = True
+    started = time.monotonic()
+
+    def release():
+        time.sleep(0.3)
+        with broker._lock:
+            broker._state["state_file_in_progress"] = False
+
+    releaser = threading.Thread(target=release)
+    releaser.start()
+    try:
+        broker._graceful_shutdown(_Server(), 15)
+    finally:
+        releaser.join()
+    assert time.monotonic() - started >= 0.3
 
 
 # ── Request bodies ────────────────────────────────────────────────────────────
@@ -2761,6 +2794,29 @@ def test_oversized_json_body_is_refused_as_such(client, monkeypatch):
     code, _, body = _raw_req(client, "POST", "/launch", payload)
     assert code == 413
     assert b"too large" in body
+
+
+@pytest.mark.parametrize("value", ["-5", "abc", "1.5"])
+def test_unusable_content_length_is_refused_as_such(client, value):
+    """A body announced with a nonsense length is not the same as no body, and
+    folding the two together answered for a field the caller did send."""
+    port = int(client.rsplit(":", 1)[1])
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        sock.sendall((
+            "POST /launch HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Content-Length: {value}\r\n\r\n"
+        ).encode())
+        sock.settimeout(5)
+        response = sock.recv(4096)
+    finally:
+        sock.close()
+    head, _, payload = response.partition(b"\r\n\r\n")
+    assert b" 400 " in head
+    # Not "rom_path is required": the response has its own Content-Length header,
+    # so only the parsed error tells the two answers apart.
+    assert json.loads(payload)["error"] == "invalid Content-Length"
 
 
 def test_malformed_json_body_is_refused_as_such(client):
