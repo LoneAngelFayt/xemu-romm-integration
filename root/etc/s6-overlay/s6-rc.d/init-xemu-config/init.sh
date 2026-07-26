@@ -11,53 +11,114 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[xemu-broker-mod] Cleaned up stale display sockets."
 
+# ── State thumbnail capture ──────────────────────────────────────────────────
+# In Wayland mode pixelflux is the compositor and implements no screencopy
+# protocol, so grim, xwd and QMP screendump all come up empty. The one frame
+# source left is the Computer Use HTTP server pixelflux can start itself, which
+# PIXELFLUX_CU turns on by naming its port. It is written into the s6 container
+# environment here so the selkies service inherits it when it starts after this
+# init, which means thumbnails need no configuration from whoever installs the
+# mod. Base images older than the Computer Use feature simply ignore it, and
+# the broker then logs a refused connection and stores no frame.
+#
+# The port must never be published. The API carries no credential and injects
+# keyboard and mouse as well as capturing frames, so anything that can reach it
+# drives the desktop. Unpublished it is reachable only from inside the
+# container, which is where the broker asking for the frame runs.
+#
+# Set PIXELFLUX_CU to move it, or to 0 to leave the server off entirely.
+CU_PORT="${PIXELFLUX_CU:-8085}"
+if [ "${PIXELFLUX_WAYLAND,,}" != "true" ]; then
+    echo "[xemu-broker-mod] Not in Wayland mode — no capture server; states will have no thumbnails."
+elif [ "$CU_PORT" = "0" ]; then
+    echo "[xemu-broker-mod] PIXELFLUX_CU=0 — capture server disabled; states will have no thumbnails."
+elif mkdir -p /run/s6/container_environment \
+     && printf '%s' "$CU_PORT" > /run/s6/container_environment/PIXELFLUX_CU; then
+    echo "[xemu-broker-mod] Frame capture server enabled on port $CU_PORT (container-internal — do not publish it)."
+else
+    echo "[xemu-broker-mod] WARNING: could not set PIXELFLUX_CU; states will have no thumbnails."
+fi
+
 # ── python3 availability ─────────────────────────────────────────────────────
-_need_apt=0
-command -v python3 &>/dev/null || _need_apt=1
-if [ "$_need_apt" = "1" ]; then
+# python3 runs the broker itself plus both config steps below. A failed install
+# used to surface only as xemu never starting, so it is reported here in full;
+# the script stays non-fatal because an s6 init must not abort container startup.
+_have_python=1
+if ! command -v python3 &>/dev/null; then
     echo "[xemu-broker-mod] Installing missing packages (python3)..."
     apt-get update -qq && apt-get install -y -qq python3 \
-        || echo "[xemu-broker-mod] ERROR: apt-get install failed"
+        || echo "[xemu-broker-mod] ERROR: apt-get install python3 failed"
+    command -v python3 &>/dev/null || _have_python=0
+fi
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: python3 is NOT on PATH after the install attempt — the RomM broker will not start, the xemu.toml seed (gamepad driver, fullscreen, Vulkan renderer pin) will be skipped and the per-container Xbox hard disk image will not be copied."
 fi
 
-# ── Patch labwc autostart to expose QMP ──────────────────────────────────────
+# ── Disable boot-time xemu in the desktop autostart ──────────────────────────
 # The base image autostart runs: xterm -e /opt/xemu/AppRun
-# We add the -qmp flag so the broker can inject ROMs and manage save states.
-# We only write if the file doesn't already contain the qmp flag, so manual
-# edits to the autostart are preserved across restarts.
-AUTOSTART="/config/.config/labwc/autostart"
-mkdir -p "$(dirname "$AUTOSTART")"
-
-QMP_SOCKET="/tmp/xemu-qmp.sock"
-QMP_FLAG="-qmp unix:${QMP_SOCKET},server,nowait"
-
-if [ ! -f "$AUTOSTART" ] || ! grep -q "xemu-qmp" "$AUTOSTART"; then
-    printf '#!/bin/bash\n\n# Run xemu with QMP socket for broker ROM injection\nxterm -e /opt/xemu/AppRun %s\n' "$QMP_FLAG" > "$AUTOSTART"
-    echo "[xemu-broker-mod] Wrote labwc autostart with QMP flag."
-else
-    echo "[xemu-broker-mod] labwc autostart already has QMP flag — skipping."
-fi
+# The broker owns the xemu lifecycle (spawns it on /launch with the -qmp flag,
+# kills it when the session ends), so a boot-time instance would fight the
+# broker for the QMP socket and busy-loop CPU cores idling at the dashboard.
+# Written for both the labwc and openbox image variants; the broker-managed
+# marker keeps manual edits from being clobbered on restart.
+for AUTOSTART in /config/.config/labwc/autostart /config/.config/openbox/autostart; do
+    mkdir -p "$(dirname "$AUTOSTART")"
+    if [ ! -f "$AUTOSTART" ] || ! grep -q "broker-managed" "$AUTOSTART"; then
+        printf '#!/bin/bash\n\n# xemu is broker-managed: the RomM broker launches it on demand with a\n# QMP socket and kills it when the session ends. Do not launch it here.\n' > "$AUTOSTART"
+        echo "[xemu-broker-mod] Wrote broker-managed autostart at $AUTOSTART."
+    else
+        echo "[xemu-broker-mod] $AUTOSTART already broker-managed — skipping."
+    fi
+done
 
 # ── Seed xemu.toml defaults ──────────────────────────────────────────────────
 # xemu stores its config at $HOME/.local/share/xemu/xemu/xemu.toml.
-# We seed two things:
+# We seed three things:
 #   [input.bindings]   port1_driver = 'usb-xbox-gamepad'  — always, so a
 #                      fresh container presents port 1 as an SDL gamepad
 #                      without requiring manual UI setup.
-#   [display]          renderer = 'opengl'                 — only on AMD GPUs,
-#                      correcting the invalid 'Vulkan' value if present.
+#   [display.window]   fullscreen_on_startup = true       — always. xemu's
+#                      window otherwise opens at its own default size in the
+#                      corner of the streamed canvas, so the player sees the
+#                      game in a small box with the rest of the frame black.
+#                      The key only exists under [display.window]; xemu drops
+#                      it from a plain [display] table.
+#   [display]          renderer = 'VULKAN'                 — only on AMD GPUs.
+#                      xemu's OpenGL path asserts in gl_fence after an amdgpu
+#                      ring-timeout reset on Renoir/Mesa, so pin Vulkan, which
+#                      is the renderer the other emulators run stably here.
+#                      xemu's toml enum tokens are upper-case: 'OPENGL',
+#                      'VULKAN', 'NULL' (a mixed-case 'Vulkan' is rejected).
 # Keys are only written if not already present so user edits are preserved.
 XEMU_CONFIG="/config/.local/share/xemu/xemu/xemu.toml"
 
+# amdgpu can be built into the kernel instead of loaded as a module, and then
+# /proc/modules says nothing about it — silently skipping the Vulkan pin and
+# leaving xemu on the OpenGL path that hangs the GPU. Fall back to the DRM
+# sysfs vendor id (0x1002 is AMD), which is there either way.
 _amd_gpu=0
-grep -q '^amdgpu ' /proc/modules 2>/dev/null && _amd_gpu=1
+if grep -q '^amdgpu ' /proc/modules 2>/dev/null; then
+    _amd_gpu=1
+else
+    for _vendor_file in /sys/class/drm/card*/device/vendor; do
+        [ -r "$_vendor_file" ] || continue
+        read -r _vendor_id < "$_vendor_file" 2>/dev/null || continue
+        if [ "$_vendor_id" = "0x1002" ]; then
+            _amd_gpu=1
+            break
+        fi
+    done
+fi
 
 if [ "$_amd_gpu" = "1" ]; then
-    echo "[xemu-broker-mod] AMD GPU detected — will seed opengl renderer."
+    echo "[xemu-broker-mod] AMD GPU detected — will pin Vulkan renderer."
 else
     echo "[xemu-broker-mod] No AMD GPU detected — skipping renderer seed."
 fi
 
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: skipping xemu.toml seed (port1_driver, fullscreen, renderer pin) — python3 is missing."
+else
 python3 - "$XEMU_CONFIG" "$_amd_gpu" <<'PYEOF'
 import sys, re
 from pathlib import Path
@@ -84,24 +145,128 @@ if did:
     print("[xemu-broker-mod] Seeded [input.bindings] port1_driver = 'usb-xbox-gamepad'.")
 
 if amd_gpu:
-    # Correct invalid 'Vulkan' (rejected by xemu) to 'opengl'.
-    # Also seeds on first run if the key is absent entirely.
-    if re.search(r"^\s*renderer\s*=\s*'Vulkan'\s*$", text, re.MULTILINE):
-        text = re.sub(r"(^\s*renderer\s*=\s*)'Vulkan'", r"\g<1>'opengl'", text, flags=re.MULTILINE)
-        print("[xemu-broker-mod] Corrected [display] renderer from 'Vulkan' to 'opengl'.")
-    else:
-        text, did = _seed(text, '[display]', 'renderer', "'opengl'")
-        if did:
-            print("[xemu-broker-mod] Seeded [display] renderer = 'opengl'.")
+    # Pin Vulkan: the OpenGL path hangs the amdgpu GPU on this stack. Force any
+    # non-Vulkan value to 'VULKAN', else seed it on first run. Enum tokens are
+    # upper-case ('OPENGL'/'VULKAN'/'NULL'); xemu writes 'OPENGL' when a user
+    # picks it in the UI, so match the existing value regardless of case.
+    m_r = re.search(r"^(\s*renderer\s*=\s*)'([^']*)'", text, re.MULTILINE)
+    if m_r:
+        if m_r.group(2) != 'VULKAN':
+            text = f"{text[:m_r.start()]}{m_r.group(1)}'VULKAN'{text[m_r.end():]}"
+            print(f"[xemu-broker-mod] Set [display] renderer to 'VULKAN' (was '{m_r.group(2)}').")
         else:
-            print("[xemu-broker-mod] [display] renderer already set — skipping.")
+            print("[xemu-broker-mod] [display] renderer already 'VULKAN'.")
+    else:
+        text, _ = _seed(text, '[display]', 'renderer', "'VULKAN'")
+        print("[xemu-broker-mod] Seeded [display] renderer = 'VULKAN'.")
+
+text, did = _seed(text, '[display.window]', 'fullscreen_on_startup', 'true')
+if did:
+    print('[xemu-broker-mod] Seeded [display.window] fullscreen_on_startup = true.')
 
 p.write_text(text)
 PYEOF
+fi
+
+# ── Per-container Xbox hard disk image ───────────────────────────────────────
+# xemu writes save-state snapshots INTO the hard disk qcow2. The stock image
+# normally sits on a shared bios mount, so every container would write its
+# snapshots into the same file and players would see each other's states. Copy
+# it into /config once and point xemu at the copy.
+HDD_LOCAL="/config/xemu/xbox_hdd.qcow2"
+HDD_STOCK="${HDD_STOCK:-/config/bios/Xbox Hard Disk Image/xbox_hdd.qcow2}"
+
+if [ "$_have_python" = "0" ]; then
+    echo "[xemu-broker-mod] ERROR: skipping the per-container hard disk image copy — python3 is missing; xemu will share the stock image and save states may collide between containers."
+else
+python3 - "$XEMU_CONFIG" "$HDD_LOCAL" "$HDD_STOCK" <<'PYEOF'
+import os, re, shutil, sys
+from pathlib import Path
+
+config, local, stock = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+text = config.read_text() if config.exists() else ''
+
+m = re.search(r"^\s*hdd_path\s*=\s*'([^']*)'", text, re.MULTILINE)
+current = m.group(1) if m else ''
+
+
+def usable(p):
+    """A qcow2 xemu can actually open. A truncated copy is worse than none:
+    xemu falls back to its first-run wizard and the container looks unset up."""
+    try:
+        if p.stat().st_size == 0:
+            return False
+        with p.open('rb') as fh:
+            return fh.read(4) == b'QFI\xfb'
+    except OSError:
+        return False
+
+
+# hdd_path is rewritten to the local copy on first run, so it stops being a
+# usable source. The stock image is the fallback origin, so a custom hdd_path
+# that is missing or truncated must not stop the copy from happening — without
+# the fallback no container-local image is ever made and /state-file 500s.
+sources = []
+if current and Path(current) != local:
+    sources.append(Path(current))
+if stock not in sources:
+    sources.append(stock)
+
+if usable(local):
+    print('[xemu-broker-mod] Hard disk image already container-local.')
+else:
+    if local.exists():
+        print(f'[xemu-broker-mod] {local} is not a usable qcow2, recopying.')
+    source = next((s for s in sources if usable(s)), None)
+    if source is None:
+        tried = ', '.join(str(s) for s in sources)
+        print(f'[xemu-broker-mod] ERROR: no usable stock hard disk image at {tried}, '
+              'leaving hdd_path alone.')
+        sys.exit(0)
+    if source != sources[0]:
+        print(f'[xemu-broker-mod] {sources[0]} is not usable — falling back to {source}.')
+    local.parent.mkdir(parents=True, exist_ok=True)
+    # Copy via a temp name so an interrupted copy never lands on the real
+    # path, where the next run would accept it as done.
+    part = local.with_name(local.name + '.part')
+    try:
+        shutil.copy2(source, part)
+        if part.stat().st_size != source.stat().st_size:
+            raise OSError(f'short copy: {part.stat().st_size} of {source.stat().st_size} bytes')
+        os.replace(part, local)
+    except OSError as exc:
+        part.unlink(missing_ok=True)
+        print(f'[xemu-broker-mod] ERROR: copying {source} -> {local} failed: {exc}')
+        sys.exit(0)
+    print(f'[xemu-broker-mod] Copied hard disk image {source} -> {local}.')
+
+if current == str(local):
+    sys.exit(0)
+
+if m:
+    text = f'{text[:m.start(1)]}{local}{text[m.end(1):]}'
+elif re.search(r'^\[sys\.files\]', text, re.MULTILINE):
+    text = re.sub(r'(^\[sys\.files\][^\n]*\n)', f"\\g<1>hdd_path = '{local}'\n",
+                  text, count=1, flags=re.MULTILINE)
+else:
+    text += f"\n[sys.files]\nhdd_path = '{local}'\n"
+
+config.write_text(text)
+print(f'[xemu-broker-mod] Pointed hdd_path at {local}.')
+PYEOF
+fi
+
+# A silent failure here only shows up much later as xemu being unable to write
+# its config or a save state, so it is reported but kept non-fatal.
+chown -R abc:abc /config/xemu 2>/dev/null \
+    || echo "[xemu-broker-mod] WARNING: could not chown /config/xemu to abc:abc; xemu may fail to write save state."
 
 # ── Fix ownership so xemu (running as abc) can write its config ───────────────
-chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null || true
-echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."
+if chown -R abc:abc "$(dirname "$XEMU_CONFIG")" 2>/dev/null; then
+    echo "[xemu-broker-mod] Fixed xemu config dir ownership (abc:abc)."
+else
+    echo "[xemu-broker-mod] WARNING: could not chown $(dirname "$XEMU_CONFIG") to abc:abc; xemu may fail to write its config."
+fi
 
 # ── Input device name diagnostic (DEBUG only) ────────────────────────────────
 if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
