@@ -89,6 +89,11 @@ STOP_WAIT = float(os.environ.get("STOP_WAIT", "5.0"))
 # headers and then stalls occupies a handler thread forever, and any exclusion
 # flag that request holds is pinned until the broker restarts.
 REQUEST_TIMEOUT = float(os.environ.get("BROKER_REQUEST_TIMEOUT", "60.0"))
+PACTL_TIMEOUT = float(os.environ.get("PACTL_TIMEOUT", "5.0"))
+
+# Every JSON body this broker accepts is a handful of fields; anything larger is
+# a mistake or an attempt to make a handler thread hold 64 KiB and up.
+JSON_BODY_MAX_BYTES = int(os.environ.get("JSON_BODY_MAX_BYTES", str(64 * 1024)))
 
 # xemu runs as abc and must be able to write snapshots into a restored image.
 _ABC_UID = int(os.environ.get("PUID", "1000"))
@@ -108,13 +113,18 @@ _LD_PRELOAD = (
 # Session environment xemu previously inherited from the desktop autostart;
 # now that the broker spawns it, replicated here for sudo -u abc env.
 ENV = {
-    "DISPLAY":            os.environ.get("DISPLAY", ":1"),
     "XDG_RUNTIME_DIR":    "/config/.XDG",
     "PULSE_RUNTIME_PATH": "/defaults",
     "LD_PRELOAD":         _LD_PRELOAD,
     "HOME":               "/config",
     "USER":               "abc",
 }
+
+# Passed through only when the base image set it. There is no default worth
+# inventing: this container exports DISPLAY=:1 while the only X socket present
+# is X0, so a hardcoded fallback aims xemu at a display that is not there.
+if os.environ.get("DISPLAY"):
+    ENV["DISPLAY"] = os.environ["DISPLAY"]
 
 logging.basicConfig(
     level=getattr(
@@ -1363,23 +1373,79 @@ def _qmp_snapshot(cmd: str, tag: str) -> bool:
         sock.close()
 
 
+# A state tag is "broker-slot-<slot>" optionally followed by ".<sequence>".
+# The sequence is what lets a save land before its predecessor is removed;
+# unsuffixed tags are states written before sequencing existed and sort oldest.
+_STATE_TAG_RE = re.compile(r"^broker-slot-(\d+)(?:\.(\d+))?$")
+
+
+def _state_tag_seq(tag: str, slot: int) -> int | None:
+    """The sequence number `tag` carries for `slot`, or None if it is not one."""
+    m = _STATE_TAG_RE.match(tag)
+    if m is None or int(m.group(1)) != slot:
+        return None
+    return int(m.group(2) or 0)
+
+
+def _state_tags_for(tags: Iterable[str], slot: int) -> list:
+    """Every tag in `tags` that names a state for `slot`, oldest first."""
+    owned = [(seq, t) for t in tags if (seq := _state_tag_seq(t, slot)) is not None]
+    return [t for _, t in sorted(owned)]
+
+
+def _current_state_tag(tags: Iterable[str], slot: int) -> str | None:
+    """The live state tag for `slot`: the newest sequence written to it."""
+    owned = _state_tags_for(tags, slot)
+    return owned[-1] if owned else None
+
+
+def _next_state_tag(tags: Iterable[str], slot: int) -> str:
+    """A tag for `slot` that no snapshot on the image holds yet."""
+    current = _current_state_tag(tags, slot)
+    seq = 0 if current is None else _state_tag_seq(current, slot) + 1
+    return f"broker-slot-{slot}.{seq}"
+
+
 def _qmp_save_state(slot: int) -> bool:
-    tag = f"broker-slot-{slot}"
-    _qmp_snapshot("snapshot-delete", tag)  # remove stale snapshot; ignore failure
-    ok = _qmp_snapshot("snapshot-save", tag)
-    if ok:
-        log.info("QMP: snapshot saved %s", tag)
-        # Best-effort: a missing frame costs the state its thumbnail and nothing
-        # else, but a stale one would show the wrong save.
-        if not _capture_state_shot(slot):
-            _delete_state_shot(slot)
-    else:
+    """Write slot `slot`, keeping the previous state until the new one exists.
+
+    QEMU's snapshot-save refuses a tag that is already on the image, so writing
+    a slot twice under one name means deleting the old state first — and a save
+    that then fails leaves the player with nothing. Each save instead goes to a
+    fresh sequence number and the older ones are dropped only once it landed."""
+    queried = _qmp_snapshot_tags()
+    if queried is None:
+        log.error("QMP: snapshot save for slot %d aborted, cannot list snapshots", slot)
+        return False
+    _, tags = queried
+    tag = _next_state_tag(tags, slot)
+    if not _qmp_snapshot("snapshot-save", tag):
         log.error("QMP: snapshot save %s failed", tag)
-    return ok
+        # A failed job can still leave a partial snapshot behind, and that one
+        # would outrank the good state it was meant to replace.
+        _qmp_snapshot("snapshot-delete", tag)
+        return False
+
+    log.info("QMP: snapshot saved %s", tag)
+    for stale in _state_tags_for(tags, slot):
+        _qmp_snapshot("snapshot-delete", stale)  # superseded; ignore failure
+    # Best-effort: a missing frame costs the state its thumbnail and nothing
+    # else, but a stale one would show the wrong save.
+    if not _capture_state_shot(slot):
+        _delete_state_shot(slot)
+    return True
 
 
 def _qmp_load_state(slot: int) -> bool:
-    tag = f"broker-slot-{slot}"
+    queried = _qmp_snapshot_tags()
+    if queried is None:
+        log.error("QMP: snapshot load for slot %d aborted, cannot list snapshots", slot)
+        return False
+    _, tags = queried
+    tag = _current_state_tag(tags, slot)
+    if tag is None:
+        log.error("QMP: snapshot load failed, slot %d holds no state", slot)
+        return False
     ok = _qmp_snapshot("snapshot-load", tag)
     if ok:
         log.info("QMP: snapshot loaded %s", tag)
@@ -1611,7 +1677,7 @@ def _pactl(*args: str) -> subprocess.CompletedProcess:
     dropping the connection with an unhandled exception."""
     cmd = _PACTL_CMD + ["pactl"] + list(args)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=PACTL_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.error("pactl timed out: %s", " ".join(args))
         return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
@@ -1666,17 +1732,31 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict | None:
+        """Parse the JSON body. None once an error response has been sent.
+
+        Every failure gets its own answer. Folding them into an empty dict made
+        an oversized or malformed body come back as "rom_path is required",
+        which points the caller at the wrong thing entirely."""
         try:
-            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
+            length = int(self.headers.get("Content-Length", 0))
         except ValueError:
-            length = 0
-        if length == 0:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return None
+        if length <= 0:
             return {}
+        if length > JSON_BODY_MAX_BYTES:
+            self._send_json(413, {"error": "request body too large"})
+            return None
         try:
-            return json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            return {}
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "body is not valid JSON"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "body must be a JSON object"})
+            return None
+        return body
 
     def _get_state_file(self):
         query = parse_qs(urlparse(self.path).query)
@@ -1764,7 +1844,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     503, {"error": "could not read saved states from the disk image"}
                 )
                 return
-        if f"broker-slot-{slot}" not in tags:
+        keep_tag = _current_state_tag(tags, slot)
+        if keep_tag is None:
             self._send_json(404, {"error": "no state for slot", "slot": slot})
             return
 
@@ -1787,7 +1868,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
             rom_name = _state["rom_name"]
 
         still_paused = False
-        keep_tag = f"broker-slot-{slot}"
         if not live:
             content = _zip_hdd_image(keep_tag)
             # A /launch slipping through would put xemu back on the image
@@ -1904,6 +1984,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/launch":
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             raw_path = body.get("rom_path", "").strip()
             if not raw_path:
                 self._send_json(400, {"error": "rom_path is required"})
@@ -1992,6 +2074,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # Body first, flag second: claiming across a client read lets one
             # request that stalls mid-body pin save_in_progress for good.
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 self._send_json(400, {"error": "slot must be 1–10"})
@@ -2028,6 +2112,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # Body first, flag second: claiming across a client read lets one
             # request that stalls mid-body pin save_in_progress for good.
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             slot = body.get("slot", 1)
             if not isinstance(slot, int) or not (1 <= slot <= 10):
                 self._send_json(400, {"error": "slot must be 1–10"})
@@ -2065,6 +2151,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             # Body first, flag second: claiming across a client read lets one
             # request that stalls mid-body pin save_in_progress for good.
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             slot = body.get("slot", 10)
             if not isinstance(slot, int) or not (0 <= slot <= 10):
                 self._send_json(400, {"error": "slot must be 0–10"})
@@ -2128,6 +2216,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/volume":
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
                 self._send_json(400, {"error": "level must be an integer 0–100"})
@@ -2141,6 +2231,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
         if self.path == "/mute":
             body = self._read_body()
+            if body is None:
+                return  # the error response is already sent
             if "mute" in body:
                 mute = body["mute"]
                 # Bare truthiness would mute on the JSON string "false", i.e. do
@@ -2185,21 +2277,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # Body first, flag second: a client that announces a Content-Length and
-        # then stalls would otherwise pin state_file_in_progress and 409 every
-        # later /launch, /setup, /save-state and /state-file. The archive is
-        # held in memory either way, so nothing is paid for reading it first.
-        content = self._read_state_body()
-        if content is None:
-            return  # the error response is already sent
-
         # Two restores share one temp file, so they must not interleave; a save
         # or launch must not run against a disk image being replaced either.
+        # Claiming before the read is also what bounds memory: the body is held
+        # whole, and without the flag N concurrent PUTs buffer N archives on a
+        # ThreadingHTTPServer that caps nothing. A client that announces a
+        # Content-Length and then stalls cannot pin the flag either, because
+        # REQUEST_TIMEOUT is set on the connection and the read gives up.
         conflict = _claim_state_file(time.monotonic())
         if conflict is not None:
             self._send_json(409, {"error": conflict})
             return
         try:
+            content = self._read_state_body()
+            if content is None:
+                return  # the error response is already sent
+
             # The check above is minutes old for a large upload — a launch can
             # have started and finished inside the body read, and restoring now
             # would replace the qcow2 that xemu has open.
@@ -2292,22 +2385,26 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
 
 def _graceful_shutdown(server: HTTPServer, signum: int) -> None:
-    """Stop the HTTP listener, let any in-flight snapshot finish, kill xemu.
+    """Stop the HTTP listener, let any in-flight state work finish, kill xemu.
     Triggered on SIGTERM/SIGINT — serve_forever()'s KeyboardInterrupt path
     does not cover SIGTERM from s6/systemd. Killing xemu here prevents the
     broker restart from leaving an orphan burning CPU with no QMP owner."""
     log.info("Received signal %d — beginning graceful shutdown", signum)
     Thread(target=server.shutdown, daemon=True).start()
 
+    # Both flags, exactly as DELETE /launch waits on them: a half-written
+    # snapshot and a /state-file read cut mid-zip are equally unusable.
     wait = max(QMP_WAIT, 5.0)
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         with _lock:
-            if not _state["save_in_progress"]:
-                break
+            transferring = _state["state_file_in_progress"]
+            saving = _state["save_in_progress"]
+        if not (transferring or saving):
+            break
         time.sleep(0.2)
     else:
-        log.warning("Shutdown: in-flight snapshot did not conclude within %.1fs", wait)
+        log.warning("Shutdown: in-flight state work did not conclude within %.1fs", wait)
 
     _kill_xemu()
     log.info("Shutdown complete")

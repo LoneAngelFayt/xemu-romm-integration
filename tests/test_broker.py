@@ -1921,37 +1921,174 @@ def test_capture_state_shot_leaves_no_partial_file(shots, cu_server):
     assert sorted(p.name for p in shots.iterdir()) == ["state-slot-4.png"]
 
 
-def test_save_state_replaces_the_frame(shots, monkeypatch):
+class _SnapshotTable:
+    """A stand-in for the snapshot table on the image, driven over QMP.
+
+    Mirrors QEMU where it counts: snapshot-save refuses a tag the image already
+    holds. That refusal is the whole reason a slot is not rewritten in place."""
+
+    def __init__(self, *tags):
+        self.tags = set(tags)
+        self.calls = []
+        self.save_fails = False
+
+    def snapshot(self, cmd, tag):
+        self.calls.append((cmd, tag))
+        if cmd == "snapshot-save":
+            if self.save_fails or tag in self.tags:
+                return False
+            self.tags.add(tag)
+            return True
+        if cmd == "snapshot-delete":
+            existed = tag in self.tags
+            self.tags.discard(tag)
+            return existed
+        return tag in self.tags  # snapshot-load
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(broker, "_qmp_snapshot", self.snapshot)
+        monkeypatch.setattr(broker, "_qmp_snapshot_tags", lambda: ("", set(self.tags)))
+        return self
+
+
+@pytest.fixture
+def snapshots(monkeypatch):
+    return _SnapshotTable().install(monkeypatch)
+
+
+def test_save_state_replaces_the_frame(shots, snapshots, monkeypatch):
     """The capture belongs to the save that just happened, not the one before."""
     shots.mkdir()
     (shots / "state-slot-2.png").write_bytes(b"stale")
-    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: True)
     monkeypatch.setattr(broker, "_capture_state_shot", lambda s: shots.joinpath(
         f"state-slot-{s}.png").write_bytes(b"fresh") or True)
     assert broker._qmp_save_state(2) is True
     assert (shots / "state-slot-2.png").read_bytes() == b"fresh"
 
 
-def test_save_state_drops_a_stale_frame_when_capture_fails(shots, monkeypatch):
+def test_save_state_drops_a_stale_frame_when_capture_fails(shots, snapshots, monkeypatch):
     """Better no thumbnail than the previous save's picture on the new state."""
     shots.mkdir()
     (shots / "state-slot-2.png").write_bytes(b"stale")
-    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: True)
     monkeypatch.setattr(broker, "_capture_state_shot", lambda s: False)
     assert broker._qmp_save_state(2) is True
     assert not (shots / "state-slot-2.png").exists()
 
 
-def test_failed_save_leaves_the_frame_alone(shots, monkeypatch):
+def test_failed_save_leaves_the_frame_alone(shots, snapshots, monkeypatch):
     """The old snapshot survives a failed save, so its frame must too."""
     shots.mkdir()
     (shots / "state-slot-2.png").write_bytes(b"previous")
-    monkeypatch.setattr(broker, "_qmp_snapshot", lambda cmd, tag: cmd != "snapshot-save")
+    snapshots.tags.add("broker-slot-2.4")
+    snapshots.save_fails = True
     monkeypatch.setattr(
         broker, "_capture_state_shot", lambda s: pytest.fail("no save, no capture")
     )
     assert broker._qmp_save_state(2) is False
     assert (shots / "state-slot-2.png").read_bytes() == b"previous"
+
+
+# ── State tags ────────────────────────────────────────────────────────────────
+
+
+def test_failed_save_keeps_the_previous_state(snapshots, shots):
+    """A save that fails must not have cost the player the state it replaced."""
+    snapshots.tags.add("broker-slot-2.4")
+    snapshots.save_fails = True
+    assert broker._qmp_save_state(2) is False
+    assert broker._current_state_tag(snapshots.tags, 2) == "broker-slot-2.4"
+
+
+def test_failed_save_removes_its_own_partial_snapshot(snapshots, shots, monkeypatch):
+    """A half-written snapshot would outrank the good one it aimed to replace,
+    so a failed job that still left its tag behind has to be cleaned up."""
+    snapshots.tags.add("broker-slot-2.4")
+
+    def half_written(cmd, tag):
+        if cmd == "snapshot-save":
+            snapshots.tags.add(tag)
+            snapshots.calls.append((cmd, tag))
+            return False
+        return snapshots.snapshot(cmd, tag)
+
+    monkeypatch.setattr(broker, "_qmp_snapshot", half_written)
+    assert broker._qmp_save_state(2) is False
+    assert snapshots.tags == {"broker-slot-2.4"}
+
+
+def test_save_supersedes_the_previous_state(snapshots, shots):
+    """One state per slot: the old tag goes only after the new one exists."""
+    snapshots.tags.add("broker-slot-2.4")
+    assert broker._qmp_save_state(2) is True
+    assert snapshots.tags == {"broker-slot-2.5"}
+    assert snapshots.calls[0] == ("snapshot-save", "broker-slot-2.5")
+
+
+def test_save_leaves_other_slots_alone(snapshots, shots):
+    snapshots.tags.update({"broker-slot-1.9", "broker-slot-10", "manual"})
+    assert broker._qmp_save_state(2) is True
+    assert snapshots.tags == {
+        "broker-slot-1.9", "broker-slot-10", "manual", "broker-slot-2.0",
+    }
+
+
+def test_save_over_a_legacy_tag_drops_it(snapshots, shots):
+    """States written before tags carried a sequence still get superseded."""
+    snapshots.tags.add("broker-slot-2")
+    assert broker._qmp_save_state(2) is True
+    assert snapshots.tags == {"broker-slot-2.1"}
+
+
+def test_load_reads_the_newest_state(snapshots):
+    snapshots.tags.update({"broker-slot-2.4", "broker-slot-2.11"})
+    assert broker._qmp_load_state(2) is True
+    assert ("snapshot-load", "broker-slot-2.11") in snapshots.calls
+
+
+def test_load_reads_a_legacy_tag(snapshots):
+    snapshots.tags.add("broker-slot-2")
+    assert broker._qmp_load_state(2) is True
+    assert ("snapshot-load", "broker-slot-2") in snapshots.calls
+
+
+def test_load_of_an_empty_slot_fails_without_touching_qmp(snapshots):
+    snapshots.tags.add("broker-slot-3.0")
+    assert broker._qmp_load_state(2) is False
+    assert snapshots.calls == []
+
+
+def test_save_aborts_when_the_snapshot_table_cannot_be_read(snapshots, monkeypatch):
+    """An unreadable table cannot pick a free tag, and guessing one risks the
+    save landing on top of a state that is already there."""
+    monkeypatch.setattr(broker, "_qmp_snapshot_tags", lambda: None)
+    assert broker._qmp_save_state(2) is False
+    assert snapshots.calls == []
+
+
+@pytest.mark.parametrize("tag,slot,seq", [
+    ("broker-slot-1", 1, 0),
+    ("broker-slot-1.7", 1, 7),
+    ("broker-slot-10.2", 10, 2),
+    ("broker-slot-10", 1, None),
+    ("broker-slot-1", 10, None),
+    ("broker-slot-1.", 1, None),
+    ("broker-slot-1.x", 1, None),
+    ("broker-slot-1.2.3", 1, None),
+    ("manual", 1, None),
+])
+def test_state_tag_seq(tag, slot, seq):
+    assert broker._state_tag_seq(tag, slot) == seq
+
+
+def test_state_tags_sort_by_sequence_not_by_string():
+    """Tag 11 is newer than tag 2, which sorting the names would get backwards."""
+    tags = {"broker-slot-1.2", "broker-slot-1.11", "broker-slot-1"}
+    assert broker._current_state_tag(tags, 1) == "broker-slot-1.11"
+    assert broker._next_state_tag(tags, 1) == "broker-slot-1.12"
+
+
+def test_next_state_tag_for_an_empty_slot():
+    assert broker._next_state_tag({"manual"}, 4) == "broker-slot-4.0"
 
 
 def test_restore_clears_every_frame(shots, hdd):
@@ -2458,12 +2595,28 @@ def test_stalled_body_does_not_pin_the_save_flag(client, monkeypatch, path):
         _drain_stalled(sock)
 
 
-def test_stalled_body_does_not_pin_the_state_file_flag(restore_client, hdd):
+def _wait_state_file_busy(timeout=5.0):
+    """Block until a handler has claimed the state-file flag.
+
+    The claim happens on the handler thread, so a fixed sleep races the
+    scheduler on a loaded machine."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with broker._lock:
+            if broker._state["state_file_in_progress"]:
+                return True
+        time.sleep(0.02)
+    return False
+
+
+def test_stalled_body_gives_the_state_file_flag_back(restore_client, hdd, monkeypatch):
+    """A restore holds the flag across the body read, so the timeout is what
+    keeps a stalled client from pinning it: without one it is held for good."""
+    monkeypatch.setattr(broker.BrokerHandler, "timeout", 0.3)
     sock = _stalled_request(restore_client, "PUT", "/state-file?filename=a.x01")
     try:
-        time.sleep(0.4)
-        with broker._lock:
-            assert broker._state["state_file_in_progress"] is False
+        assert _wait_state_file_busy()
+        assert _wait_state_file_idle()
         code, _, _ = _raw_req(
             restore_client, "PUT", "/state-file?filename=b.x02",
             _state_archive(b"pushed"),
@@ -2474,10 +2627,98 @@ def test_stalled_body_does_not_pin_the_state_file_flag(restore_client, hdd):
         _drain_stalled(sock)
 
 
+def test_second_restore_is_refused_rather_than_buffered(restore_client, monkeypatch):
+    """The flag is claimed before the body, so only one archive is ever held in
+    memory; the server would otherwise buffer 2 GiB per concurrent push."""
+    monkeypatch.setattr(broker.BrokerHandler, "timeout", 3.0)
+    sock = _stalled_request(restore_client, "PUT", "/state-file?filename=a.x01")
+    try:
+        assert _wait_state_file_busy()
+        code, _, body = _raw_req(
+            restore_client, "PUT", "/state-file?filename=b.x02",
+            _state_archive(b"pushed"),
+        )
+        assert code == 409
+        assert b"already in progress" in body
+    finally:
+        _drain_stalled(sock)
+
+
 def test_handler_has_a_request_timeout():
     """Without one, a client that stalls owns a handler thread forever."""
     assert broker.BrokerHandler.timeout is not None
     assert broker.BrokerHandler.timeout > 0
+
+
+def test_graceful_shutdown_waits_for_a_state_file_read(monkeypatch):
+    """SIGTERM landing mid-zip leaves the puller with half an archive, exactly
+    what DELETE /launch drains for; the signal path waited on saves only."""
+    killed = []
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: killed.append(time.monotonic()))
+
+    class _Server:
+        def shutdown(self):
+            pass
+
+    with broker._lock:
+        broker._state["state_file_in_progress"] = True
+    release_at = time.monotonic() + 0.4
+
+    def release():
+        time.sleep(0.4)
+        with broker._lock:
+            broker._state["state_file_in_progress"] = False
+
+    releaser = threading.Thread(target=release)
+    releaser.start()
+    try:
+        broker._graceful_shutdown(_Server(), 15)
+    finally:
+        releaser.join()
+    assert killed and killed[0] >= release_at
+
+
+def test_graceful_shutdown_gives_up_on_a_flag_that_never_clears(monkeypatch):
+    """The stop still wins: a wedged transfer must not block the restart."""
+    monkeypatch.setattr(broker, "QMP_WAIT", 0.1)
+    monkeypatch.setattr(broker, "_kill_xemu", lambda: None)
+
+    class _Server:
+        def shutdown(self):
+            pass
+
+    with broker._lock:
+        broker._state["state_file_in_progress"] = True
+    started = time.monotonic()
+    broker._graceful_shutdown(_Server(), 15)
+    # wait is floored at 5s, so this only proves it is bounded, not prompt.
+    assert time.monotonic() - started < 15
+
+
+# ── Request bodies ────────────────────────────────────────────────────────────
+
+
+def test_oversized_json_body_is_refused_as_such(client, monkeypatch):
+    """Truncating at the cap instead made an oversized body come back as
+    "rom_path is required", pointing the caller at entirely the wrong thing."""
+    monkeypatch.setattr(broker, "JSON_BODY_MAX_BYTES", 1024)
+    payload = json.dumps({"rom_path": "/romm/library/x.iso", "pad": "p" * 4096}).encode()
+    code, _, body = _raw_req(client, "POST", "/launch", payload)
+    assert code == 413
+    assert b"too large" in body
+
+
+def test_malformed_json_body_is_refused_as_such(client):
+    code, _, body = _raw_req(client, "POST", "/launch", b"{not json")
+    assert code == 400
+    assert b"not valid JSON" in body
+
+
+def test_non_object_json_body_is_refused(client):
+    """body.get would raise on a list, and the handler answers 500 for that."""
+    code, _, body = _raw_req(client, "POST", "/launch", b"[1, 2, 3]")
+    assert code == 400
+    assert b"JSON object" in body
 
 
 def test_request_timeout_drops_a_stalled_client(client, monkeypatch):
