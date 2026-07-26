@@ -805,6 +805,118 @@ def test_validate_rom_path_rejects_symlink_escaping_root(rom_root, tmp_path):
     assert broker._validate_rom_path(str(link)) is None
 
 
+# ── Folder-organized ROMs ─────────────────────────────────────────────────────
+#
+# RomM addresses a folder-organized game by its folder: `Rom.full_path` is
+# `fs_path/fs_name`, and for a multi-file ROM `fs_name` is the directory rather
+# than the disc image inside it, so /launch receives a path xemu cannot mount.
+
+
+def _disc(root, rel):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"iso")
+    return p
+
+
+def test_resolve_rom_file_passes_a_plain_file_through(rom_root):
+    iso = _disc(rom_root, "xbox/Fable.xiso.iso")
+    assert broker._resolve_rom_file(iso) == iso
+
+
+def test_resolve_rom_file_finds_the_disc_inside_a_game_folder(rom_root):
+    iso = _disc(rom_root, "xbox/Fable/Fable.xiso.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Fable") == iso
+
+
+def test_resolve_rom_file_returns_none_for_a_folder_with_no_disc(rom_root):
+    _disc(rom_root, "xbox/Fable/cover.png")
+    _disc(rom_root, "xbox/Fable/notes.txt")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Fable") is None
+
+
+def test_resolve_rom_file_picks_disc_one_of_a_multi_disc_set(rom_root):
+    disc1 = _disc(rom_root, "xbox/Game/Game (Disc 1).iso")
+    _disc(rom_root, "xbox/Game/Game (Disc 2).iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == disc1
+
+
+def test_resolve_rom_file_looks_one_level_into_per_disc_subfolders(rom_root):
+    disc1 = _disc(rom_root, "xbox/Game/Disc 1/Game.iso")
+    _disc(rom_root, "xbox/Game/Disc 2/Game.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == disc1
+
+
+def test_resolve_rom_file_prefers_the_top_level_disc_over_a_nested_one(rom_root):
+    top = _disc(rom_root, "xbox/Game/Game.iso")
+    _disc(rom_root, "xbox/Game/extras/bonus.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") == top
+
+
+def test_resolve_rom_file_does_not_descend_past_the_second_level(rom_root):
+    _disc(rom_root, "xbox/Game/a/b/deep.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") is None
+
+
+def test_resolve_rom_file_ignores_hidden_files(rom_root):
+    _disc(rom_root, "xbox/Game/._Game.iso")
+    assert broker._resolve_rom_file(rom_root / "xbox" / "Game") is None
+
+
+def test_resolve_rom_file_refuses_a_symlink_escaping_rom_root(rom_root, tmp_path):
+    outside = tmp_path / "outside.iso"
+    outside.write_bytes(b"iso")
+    folder = rom_root / "xbox" / "Game"
+    folder.mkdir(parents=True)
+    (folder / "link.iso").symlink_to(outside)
+    assert broker._resolve_rom_file(folder) is None
+
+
+def test_resolve_rom_file_returns_none_for_a_missing_path(rom_root):
+    assert broker._resolve_rom_file(rom_root / "xbox" / "nope") is None
+
+
+@pytest.fixture
+def loads(monkeypatch):
+    """Capture what /launch hands the load thread instead of touching xemu."""
+    calls = []
+    monkeypatch.setattr(
+        broker, "_do_load_rom",
+        lambda path, slot=None, gen=None: calls.append((path, slot)),
+    )
+    return calls
+
+
+def test_launch_boots_the_disc_inside_a_game_folder(client, rom_root, loads):
+    iso = _disc(rom_root, "xbox/Fable/Fable.xiso.iso")
+    code, body = _req(client, "POST", "/launch",
+                      {"rom_path": str(rom_root / "xbox" / "Fable")})
+    assert code == 200
+    assert body["rom_path"] == str(iso)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not loads:
+        time.sleep(0.02)
+    assert loads[-1] == (str(iso), None)
+
+
+def test_launch_reports_a_folder_with_no_disc_distinctly(client, rom_root, loads):
+    _disc(rom_root, "xbox/Fable/cover.png")
+    code, body = _req(client, "POST", "/launch",
+                      {"rom_path": str(rom_root / "xbox" / "Fable")})
+    assert code == 422
+    assert "no bootable ROM file" in body["error"]
+    assert ".iso" in body["extensions"]
+    assert loads == []
+    assert not broker._state["launch_in_progress"]
+
+
+def test_launch_still_reports_a_missing_path_as_missing(client, rom_root, loads):
+    code, body = _req(client, "POST", "/launch",
+                      {"rom_path": str(rom_root / "xbox" / "nope.iso")})
+    assert code == 422
+    assert body["error"] == "rom_path does not exist"
+
+
 # ── State file archives ───────────────────────────────────────────────────────
 
 

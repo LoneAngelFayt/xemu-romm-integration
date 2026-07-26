@@ -203,7 +203,8 @@ Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is conf
 
 #### `/launch` (POST)
 
-Validates `rom_path` is within `ROM_ROOT`, then starts a background thread that:
+Validates `rom_path` is within `ROM_ROOT` and resolves it to a disc image (see
+[ROM path resolution](#rom-path-resolution)), then starts a background thread that:
 1. Spawns xemu with the disc already in the drive (`-dvd_path`) if none is running, so the game boots from power-on
 2. Polls QMP until xemu is ready (up to `QMP_BOOT_TIMEOUT` seconds)
 3. Only when reusing an already-booted xemu: inserts the disc via `blockdev-change-medium`, then sends `system_reset` and waits for the `RESET` event confirmation (3 retries)
@@ -211,6 +212,22 @@ Validates `rom_path` is within `ROM_ROOT`, then starts a background thread that:
 A cold start must never be reset. QMP answers about a second after the process starts, while the guest is still inside the MCPX bootrom, and a reset landing there wedges the machine — it stays `running` and burns a full core, but never draws a frame or plays a sample.
 
 Returns `200 {"status": "loading"}` immediately. Poll `/status` to confirm `active: true`.
+
+##### ROM path resolution
+
+`rom_path` may be either a file or a **directory**, for libraries laid out one
+game per folder (`roms/xbox/Fable/Fable.xiso.iso`). RomM addresses such a game
+by its folder, because `Rom.full_path` is `fs_path/fs_name` and for a
+multi-file ROM `fs_name` is the directory, so the broker looks inside for the
+disc image: the folder itself first, then one level down for the per-disc
+subfolders some sets use. Only XISO images (`.iso`, including the `.xiso.iso`
+double extension) are considered, ranked by name so a multi-disc set boots
+disc 1. Dot-files are skipped, and a symlink pointing outside `ROM_ROOT` is
+never chosen. The resolved file is what `/status` and the response body report.
+
+A directory with no disc image inside returns `422` with the accepted
+extensions in an `extensions` field, which is a different message from the
+`422` for a path that does not exist at all.
 
 #### `/setup` (POST)
 
