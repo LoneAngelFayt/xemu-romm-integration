@@ -2644,6 +2644,61 @@ def test_second_restore_is_refused_rather_than_buffered(restore_client, monkeypa
         _drain_stalled(sock)
 
 
+def test_trickling_body_cannot_outlast_the_transfer_budget(restore_client, monkeypatch):
+    """A byte now and then resets the connection timeout forever, so that alone
+    never takes the state-file flag back; the whole-transfer budget does."""
+    monkeypatch.setattr(broker.BrokerHandler, "timeout", 1.0)
+    monkeypatch.setattr(broker, "STATE_FILE_READ_TIMEOUT", 0.5)
+    sock = _stalled_request(restore_client, "PUT", "/state-file?filename=a.x01")
+    stop = threading.Event()
+
+    def trickle():
+        # Slower than the announced body needs, faster than the per-recv timeout.
+        while not stop.is_set():
+            try:
+                sock.sendall(b"x")
+            except OSError:
+                return
+            stop.wait(0.1)
+
+    dribbler = threading.Thread(target=trickle, daemon=True)
+    dribbler.start()
+    try:
+        assert _wait_state_file_busy()
+        # The client is still sending and the flag is already back.
+        assert _wait_state_file_idle()
+        stop.set()
+        dribbler.join(2)
+        sock.settimeout(5)
+        assert b" 408 " in sock.recv(4096)
+    finally:
+        stop.set()
+        _drain_stalled(sock)
+
+
+def test_a_body_that_arrives_in_pieces_still_lands(restore_client, hdd):
+    """The chunked read must reassemble a body split across several packets,
+    which one rfile.read(length) got for free."""
+    archive = _state_archive(b"pushed")
+    port = int(restore_client.rsplit(":", 1)[1])
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        sock.sendall((
+            "PUT /state-file?filename=a.x01 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Content-Length: {len(archive)}\r\n\r\n"
+        ).encode())
+        for i in range(0, len(archive), 64):
+            sock.sendall(archive[i:i + 64])
+            time.sleep(0.005)
+        sock.settimeout(10)
+        assert b" 200 " in sock.recv(4096)
+    finally:
+        sock.close()
+    assert _wait_state_file_idle()
+    assert hdd.read_bytes() == b"pushed"
+
+
 def test_handler_has_a_request_timeout():
     """Without one, a client that stalls owns a handler thread forever."""
     assert broker.BrokerHandler.timeout is not None

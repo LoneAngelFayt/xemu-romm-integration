@@ -64,6 +64,15 @@ STATE_FILE_MAX_BYTES = int(os.environ.get("STATE_FILE_MAX_BYTES", str(2 * 1024 *
 HDD_IMAGE_MAX_BYTES = int(os.environ.get("HDD_IMAGE_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
 STATE_GET_WAIT = float(os.environ.get("STATE_GET_WAIT", "30.0"))
 
+# Whole-transfer budget for a pushed archive. REQUEST_TIMEOUT bounds one recv,
+# not the transfer, so a peer trickling a byte per timeout would hold the
+# state-file flag (and with it every launch and save) for as long as it liked.
+# RomM gives up on its own side at 240s, so the legitimate path never gets here.
+STATE_FILE_READ_TIMEOUT = float(os.environ.get("STATE_FILE_READ_TIMEOUT", "300.0"))
+# One recv worth of body. Small enough to re-check the budget often, large
+# enough that a 2 GiB push is not a million round trips through Python.
+_BODY_CHUNK_BYTES = 1024 * 1024
+
 # A state archive carries only the snapshot it is for. xemu keeps every slot in
 # one qcow2 and cannot export a snapshot on its own, so without this slot 5
 # ships slots 1-4 inside it and archives grow with every save. Set to 0 to serve
@@ -1708,6 +1717,10 @@ def _cleanup_sockets():
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 
+class _BodyTimeout(Exception):
+    """The peer spent the whole transfer budget without finishing its body."""
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
     # socketserver applies this to the connection in setup(). Without it a
     # client can hold a handler thread (and any flag that request claimed)
@@ -2281,9 +2294,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # or launch must not run against a disk image being replaced either.
         # Claiming before the read is also what bounds memory: the body is held
         # whole, and without the flag N concurrent PUTs buffer N archives on a
-        # ThreadingHTTPServer that caps nothing. A client that announces a
-        # Content-Length and then stalls cannot pin the flag either, because
-        # REQUEST_TIMEOUT is set on the connection and the read gives up.
+        # ThreadingHTTPServer that caps nothing. What bounds how long the flag
+        # is held is STATE_FILE_READ_TIMEOUT in _read_exactly, not the
+        # connection timeout, which expires per recv and so never fires for a
+        # peer that keeps dribbling bytes.
         conflict = _claim_state_file(time.monotonic())
         if conflict is not None:
             self._send_json(409, {"error": conflict})
@@ -2317,11 +2331,47 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if length > STATE_FILE_MAX_BYTES:
             self._send_json(413, {"error": "state file exceeds size limit"})
             return None
-        content = self.rfile.read(length)
+        try:
+            content = self._read_exactly(length, STATE_FILE_READ_TIMEOUT)
+        except _BodyTimeout:
+            log.error("state-file: giving up on a body that took over %.0fs",
+                      STATE_FILE_READ_TIMEOUT)
+            self._send_json(408, {"error": "timed out reading the state file"})
+            return None
         if len(content) != length:
             self._send_json(400, {"error": "truncated request body"})
             return None
         return content
+
+    def _read_exactly(self, length: int, budget: float) -> bytes:
+        """Read `length` bytes; raise _BodyTimeout once `budget` is spent.
+
+        The connection timeout bounds a single recv, not the whole transfer, so
+        it alone cannot stop a peer that dribbles one byte per timeout. Reads
+        arrive in chunks rather than one rfile.read(length) so the budget is
+        re-checked as the body comes in. A short return means the peer closed
+        early, which the caller reports as a truncated body."""
+        deadline = time.monotonic() + budget
+        chunks = []
+        remaining = length
+        try:
+            while remaining > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _BodyTimeout
+                # Neither bound alone is enough: the budget caps the transfer,
+                # the handler timeout still cuts off a peer that goes silent.
+                self.connection.settimeout(min(left, self.timeout or left))
+                chunk = self.rfile.read1(min(remaining, _BODY_CHUNK_BYTES))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except TimeoutError as exc:
+            raise _BodyTimeout from exc
+        finally:
+            self.connection.settimeout(self.timeout)
+        return b"".join(chunks)
 
     def _restore_state_file(self, filename: str, content: bytes):
         """Swap in the pushed disk image. Caller holds the flag."""
