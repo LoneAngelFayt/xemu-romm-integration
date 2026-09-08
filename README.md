@@ -6,6 +6,43 @@ Launch original Xbox games from the RomM web UI with save states, controller inp
 
 The broker owns the xemu process. It spawns xemu with a QMP socket when a ROM is launched and kills it when the session ends, so there is never a gameless instance sitting at the dashboard. That matters more than it sounds: xemu is QEMU-based and has no frame limiter with nothing loaded, so an idle instance pegs a CPU or GPU for as long as the container is up.
 
+## Migrating to webstation (v2)
+
+This per-emulator broker mod is deprecated. RomM's emulator streaming is moving to a single [docker-webstation](https://github.com/linuxserver/docker-webstation) container running [romm-broker](https://github.com/romm-streaming/romm-broker), which replaces one container per emulator. This mod keeps working today, but it will not get new features, and RomM will eventually drop support for a `config.yml` container that has no `protocol: webstation`.
+
+Why: one container serving every platform instead of one per emulator, and one broker implementation instead of five drifting forks.
+
+Before, a dedicated xemu container:
+
+```yaml
+streaming:
+  containers:
+    - platform: xbox
+      host: https://192.168.1.53:3000
+      broker_host: http://192.168.1.53:8000
+      label: xemu
+```
+
+After, xbox nested under a webstation container's `platforms:` map:
+
+```yaml
+streaming:
+  containers:
+    - host: https://192.168.1.56:3010
+      protocol: webstation
+      subfolder: /streaming
+      library_path: /romm
+      label: Emulation station
+      platforms:
+        xbox:
+          emulator: xemu
+          label: xemu
+```
+
+Xbox has no memory card, so there is no `memory_card_sync` field here (PS2 and GameCube carry one).
+
+See RomM's [`docs/STREAMING_MIGRATION.md`](https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md) for the full guide.
+
 ## Features
 
 - Launch Xbox ROMs on demand from RomM (XISO `.iso`)
@@ -136,7 +173,9 @@ If no xemu is running, it spawns one with the disc already in the drive (`-dvd_p
 
 **A cold start must never be reset.** QMP starts answering about a second in, while the guest is still inside the MCPX bootrom, and a reset landing there wedges the machine: it stays `running` and burns a full core, but never draws a frame or plays a sample.
 
-`rom_path` may be a file or a **directory**, for libraries laid out one game per folder. RomM addresses those games by folder, so the broker looks inside — the folder itself first, then one level down for the per-disc subfolders some sets use. Only XISO images count (`.iso`, including the `.xiso.iso` double extension), ranked by name so a multi-disc set boots disc 1. Dot-files are skipped and a symlink pointing outside `ROM_ROOT` is never chosen. A directory with no disc inside returns `422` listing the accepted extensions.
+`rom_path` may be a file or a **directory**, for libraries laid out one game per folder. RomM addresses those games by folder, so the broker looks inside, in the folder itself and one level down for the per-disc subfolders some sets use. Only XISO images count (`.iso`, including the `.xiso.iso` double extension). Everything found across both levels is ranked together by disc number, then depth, then name, so a multi-disc set starts on disc 1. The marker is read from the file or folder name (`Disc 1`, `(Disc 2)`, `CD1`) and compared as a number rather than as text, which keeps disc 2 ahead of disc 10; a name mentioning no disc counts as disc 1. Dot-files are skipped and a symlink pointing outside `ROM_ROOT` is never chosen. A directory with no disc inside returns `422` listing the accepted extensions.
+
+Resolution only chooses where a session starts. There is no disc swapping, so a game that asks for its next disc cannot be given one.
 
 #### POST /setup
 
