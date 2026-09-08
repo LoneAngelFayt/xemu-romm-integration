@@ -6,6 +6,43 @@ Launch original Xbox games from the RomM web UI with save states, controller inp
 
 The broker owns the xemu process. It spawns xemu with a QMP socket when a ROM is launched and kills it when the session ends, so there is never a gameless instance sitting at the dashboard. That matters more than it sounds: xemu is QEMU-based and has no frame limiter with nothing loaded, so an idle instance pegs a CPU or GPU for as long as the container is up.
 
+## Migrating to webstation (v2)
+
+This per-emulator broker mod is deprecated. RomM's emulator streaming is moving to a single [docker-webstation](https://github.com/linuxserver/docker-webstation) container running [romm-broker](https://github.com/romm-streaming/romm-broker), which replaces one container per emulator. This mod keeps working today, but it will not get new features, and RomM will eventually drop support for a `config.yml` container that has no `protocol: webstation`.
+
+Why: one container serving every platform instead of one per emulator, and one broker implementation instead of five drifting forks.
+
+Before, a dedicated xemu container:
+
+```yaml
+streaming:
+  containers:
+    - platform: xbox
+      host: https://192.168.1.53:3000
+      broker_host: http://192.168.1.53:8000
+      label: xemu
+```
+
+After, xbox nested under a webstation container's `platforms:` map:
+
+```yaml
+streaming:
+  containers:
+    - host: https://192.168.1.56:3010
+      protocol: webstation
+      subfolder: /streaming
+      library_path: /romm
+      label: Emulation station
+      platforms:
+        xbox:
+          emulator: xemu
+          label: xemu
+```
+
+Xbox has no memory card, so there is no `memory_card_sync` field here (PS2 and GameCube carry one).
+
+See RomM's [`docs/STREAMING_MIGRATION.md`](https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md) for the full guide.
+
 ## Features
 
 - Launch Xbox ROMs on demand from RomM (XISO `.iso`)
